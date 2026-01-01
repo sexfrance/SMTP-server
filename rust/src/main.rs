@@ -84,7 +84,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Create PostgreSQL connection pool for temporary emails
     let postgres_pool = PgPoolOptions::new()
-        .max_connections(20)
+        .max_connections(50)
         .connect(&database_url)
         .await?;
     info!("✓ Connected to PostgreSQL database");
@@ -137,8 +137,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Concurrency control
-    let semaphore = Arc::new(Semaphore::new(10));
-    let max_queue = 100;
+    let semaphore = Arc::new(Semaphore::new(50));
+    let max_queue = 2000;
     let queue_counter = Arc::new(Mutex::new(0usize));
 
     // Start TCP listener for SMTP
