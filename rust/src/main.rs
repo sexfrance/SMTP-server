@@ -4,7 +4,7 @@ use tokio::{
     sync::{Semaphore, Mutex, RwLock},
     time::Duration,
 };
-use std::{collections::{HashSet}, env, sync::Arc};
+use std::{collections::{HashSet}, env, sync::{Arc, atomic::{AtomicUsize, Ordering}}};
 use mailparse::{parse_mail, MailHeaderMap};
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use reqwest::Client;
@@ -55,7 +55,10 @@ struct DomainResponse {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
-    
+
+    // Connection slot counter for tracking which of the 50 slots is handling each connection
+    let connection_counter = Arc::new(AtomicUsize::new(0));
+
     tracing_subscriber::fmt()
         .with_target(false)
         .with_thread_ids(false)
@@ -136,6 +139,28 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Start heartbeat task (if enabled)
+    if let Some(hb_url) = heartbeat_url.clone() {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                match Client::new().get(&hb_url).send().await {
+                    Ok(response) => {
+                        if response.status().is_success() {
+                            info!("✓ Heartbeat sent successfully");
+                        } else {
+                            warn!("⚠ Heartbeat failed: {}", response.status());
+                        }
+                    },
+                    Err(e) => {
+                        error!("✗ Heartbeat error: {}", e);
+                    }
+                }
+            }
+        });
+    }
+
     // Concurrency control
     let semaphore = Arc::new(Semaphore::new(50));
     let max_queue = 2000;
@@ -146,31 +171,34 @@ async fn main() -> anyhow::Result<()> {
     info!("✓ SMTP Receiver running on port {}", listen_port);
 
     loop {
-    let (socket, addr) = listener.accept().await?;
-        
+        let (socket, addr) = listener.accept().await?;
+
         let postgres_pool = postgres_pool.clone();
         let whitelist = domain_whitelist.clone();
-        let supabase_url = supabase_url.clone();
-        let supabase_key = supabase_key.clone();
-            let bans_cache = bans_cache.clone();
+        let bans_cache = bans_cache.clone();
         let semaphore = semaphore.clone();
         let queue_counter = queue_counter.clone();
-        let heartbeat_url = heartbeat_url.clone();
+        let connection_counter = connection_counter.clone();
 
         tokio::spawn(async move {
             let _permit = semaphore.acquire().await.unwrap();
+            
+            // Assign connection slot (1-50)
+            let conn_slot = (connection_counter.fetch_add(1, Ordering::Relaxed) % 50) + 1;
+            let instance = Arc::new(format!("slot:{}", conn_slot));
+            
             let queue_size = {
                 let mut q = queue_counter.lock().await;
                 if *q >= max_queue {
-                    warn!("Server busy, rejecting connection {} [Queue: {}/{}]", addr, *q, max_queue);
+                    warn!("Server busy, rejecting connection {} [Queue: {}/{}] [inst: {}]", addr, *q, max_queue, instance.as_str());
                     return;
                 }
                 *q += 1;
                 *q
             };
 
-            info!("[SMTP IN] New connection from {} -> local [Queue: {}/{}]", addr, queue_size, max_queue);
-            if let Err(e) = handle_smtp(socket, postgres_pool, whitelist, supabase_url, supabase_key, heartbeat_url, bans_cache).await {
+            info!("[SMTP IN] New connection from {} -> local [Queue: {}/{}] [inst: {}]", addr, queue_size, max_queue, instance.as_str());
+            if let Err(e) = handle_smtp(socket, postgres_pool, whitelist, bans_cache, instance.clone()).await {
                 error!("Error handling {}: {:?}", addr, e);
             }
 
@@ -179,7 +207,7 @@ async fn main() -> anyhow::Result<()> {
                 *q -= 1;
                 *q
             };
-            info!("[SMTP OUT] Connection closed from {} [Queue: {}/{}]", addr, queue_size, max_queue);
+            info!("[SMTP OUT] Connection closed from {} [Queue: {}/{}] [inst: {}]", addr, queue_size, max_queue, instance.as_str());
         });
     }
 }
@@ -189,10 +217,8 @@ async fn handle_smtp(
     socket: tokio::net::TcpStream,
     postgres_pool: PgPool,
     whitelist: Arc<Mutex<HashSet<String>>>,
-    supabase_url: String,
-    supabase_key: String,
-    heartbeat_url: Option<String>,
     bans_cache: Arc<RwLock<BansCache>>,
+    instance: Arc<String>,
 ) -> anyhow::Result<()> {
     let (reader, mut writer) = socket.into_split();
     let mut reader = BufReader::new(reader);
@@ -214,11 +240,11 @@ async fn handle_smtp(
         if data_mode {
             if cmd == "." {
                 data_mode = false;
-                info!("[SMTP IN] DATA stream completed");
-                match process_email(&email_data, &rcpt_to, &mail_from, &postgres_pool, &whitelist, heartbeat_url.clone(), &bans_cache).await {
+                info!("[SMTP IN] DATA stream completed [inst: {}]", instance.as_str());
+                match process_email(&email_data, &rcpt_to, &mail_from, &postgres_pool, &whitelist, &bans_cache, instance.clone()).await {
                     Ok(_) => {
                         writer.write_all(b"250 Ok: Message accepted\r\n").await?;
-                        info!("✓ Email processed successfully");
+                        info!("✓ Email processed successfully [inst: {}]", instance.as_str());
                     },
                     Err(e) => {
                         error!("Failed to process email: {}", e);
@@ -234,11 +260,11 @@ async fn handle_smtp(
 
         if cmd.starts_with("HELO") || cmd.starts_with("EHLO") {
             let hostname = cmd.split_whitespace().nth(1).unwrap_or("unknown");
-            info!("[SMTP IN] {} from {}", cmd.split_whitespace().next().unwrap_or("HELO"), hostname);
+            info!("[SMTP IN] {} from {} [inst: {}]", cmd.split_whitespace().next().unwrap_or("HELO"), hostname, instance.as_str());
             writer.write_all(b"250 Hello\r\n").await?;
         } else if cmd.starts_with("MAIL FROM:") {
             mail_from = cmd[10..].trim().to_string();
-            info!("[SMTP IN] MAIL FROM: {}", mail_from);
+            info!("[SMTP IN] MAIL FROM: {} [inst: {}]", mail_from, instance.as_str());
             writer.write_all(b"250 Ok\r\n").await?;
         } else if cmd.starts_with("RCPT TO:") {
             rcpt_to = cmd[8..].trim().to_string();
@@ -261,33 +287,33 @@ async fn handle_smtp(
                 // Check domain bans from in-memory cache
                     // domain bans: check global bans
                     if is_domain_banned(&domain, &bans_cache).await {
-                        warn!("[Bans] Rejected RCPT TO: {} (domain banned)", email);
+                        warn!("[Bans] Rejected RCPT TO: {} (domain banned) [inst: {}]", email, instance.as_str());
                         writer.write_all(b"550 Domain banned\r\n").await?;
                     } else {
-                        info!("[SMTP IN] RCPT TO: {}", email);
+                        info!("[SMTP IN] RCPT TO: {} [inst: {}]", email, instance.as_str());
                         writer.write_all(b"250 Ok\r\n").await?;
                     }
             }
         } else if cmd == "DATA" {
             data_mode = true;
-            info!("[SMTP IN] DATA command received");
+            info!("[SMTP IN] DATA command received [inst: {}]", instance.as_str());
             writer.write_all(b"354 End data with <CR><LF>.<CR><LF>\r\n").await?;
         } else if cmd == "QUIT" {
-            info!("[SMTP IN] QUIT command received");
+            info!("[SMTP IN] QUIT command received [inst: {}]", instance.as_str());
             writer.write_all(b"221 Bye\r\n").await?;
             break;
         } else if cmd == "RSET" {
-            info!("[SMTP IN] RSET command received");
+            info!("[SMTP IN] RSET command received [inst: {}]", instance.as_str());
             mail_from.clear();
             rcpt_to.clear();
             email_data.clear();
             data_mode = false;
             writer.write_all(b"250 Ok\r\n").await?;
         } else if cmd == "NOOP" {
-            info!("[SMTP IN] NOOP command received");
+            info!("[SMTP IN] NOOP command received [inst: {}]", instance.as_str());
             writer.write_all(b"250 Ok\r\n").await?;
         } else {
-            warn!("[SMTP IN] Unknown command: {}", cmd);
+            warn!("[SMTP IN] Unknown command: {} [inst: {}]", cmd, instance.as_str());
             writer.write_all(b"502 Command not implemented\r\n").await?;
         }
     }
@@ -310,13 +336,13 @@ async fn process_email(
     mail_from: &str,
     postgres_pool: &PgPool,
     whitelist: &Arc<Mutex<HashSet<String>>>,
-    heartbeat_url: Option<String>,
     bans_cache: &Arc<RwLock<BansCache>>,
+    instance: Arc<String>,
 ) -> anyhow::Result<()> {
     // Join all email data lines with CRLF (SMTP standard)
     let raw_email = data.join("\r\n");
     
-    info!("📧 Processing email - Raw size: {} bytes", raw_email.len());
+    info!("📧 Processing email - Raw size: {} bytes [inst: {}]", raw_email.len(), instance.as_str());
 
     let recipient_email = extract_email(rcpt_to).to_lowercase();
     let from_address = extract_email(mail_from).to_lowercase();
@@ -360,7 +386,7 @@ async fn process_email(
         }
     };
     
-    info!("✉ Parsed email for {} from {} - Subject: '{}'", recipient_email, from_address, subject);
+    info!("✉ Parsed email for {} from {} - Subject: '{}' [inst: {}]", recipient_email, from_address, subject, instance.as_str());
 
     // First check if this is a private email (Postgres)
     match sqlx::query("SELECT id FROM private_email WHERE email = $1 LIMIT 1")
@@ -388,16 +414,13 @@ async fn process_email(
 
                 match insert_res {
                     Ok(_res) => {
-                        info!("✓ Saved email for private user in Postgres: {} -> {}", from_address, recipient_email);
+                        info!("✓ Saved email for private user in Postgres: {} -> {} [inst: {}]", from_address, recipient_email, instance.as_str());
                         // Update last_updated_at for the private_email row
                         let _ = sqlx::query("UPDATE private_email SET last_updated_at = NOW() WHERE email = $1")
                             .bind(&recipient_email)
                             .execute(postgres_pool)
                             .await;
 
-                        if heartbeat_url.is_some() {
-                            send_heartbeat(&heartbeat_url.as_ref().unwrap()).await;
-                        }
                         return Ok(());
                     }
                     Err(e) => {
@@ -416,7 +439,7 @@ async fn process_email(
     // Get or create inbox and parse email in parallel
     let raw_email_clone = raw_email.clone();
     let ( _ , parsed_result ) = tokio::join!(
-        get_or_create_inbox_pg(postgres_pool, &recipient_email),
+        get_or_create_inbox_pg(postgres_pool, &recipient_email, instance.clone()),
         tokio::task::spawn_blocking(move || {
             let data = raw_email_clone;
             let bodies_result = match parse_mail(data.as_bytes()) {
@@ -487,7 +510,7 @@ async fn process_email(
             let html_body = String::new();
 
             let to_addrs_vec = vec![recipient_email.clone()];
-            info!("Saving to PostgreSQL (fallback): mailbox_owner={}, mailbox=INBOX, subject={}, from={}, size={}", recipient_email, subject, from_address, text_body.len());
+            info!("Saving to PostgreSQL (fallback): mailbox_owner={}, mailbox=INBOX, subject={}, from={}, size={} [inst: {}]", recipient_email, subject, from_address, text_body.len(), instance.as_str());
 
             let insert_res = sqlx::query(
                 "INSERT INTO emails (mailbox_owner, mailbox, subject, body, html, from_addr, to_addrs, size, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())"
@@ -509,12 +532,8 @@ async fn process_email(
                     error!("Attempted insert values: mailbox_owner={}, subject={}, from={}, to_addrs={:?}, size={}", recipient_email, subject, from_address, to_addrs_vec, raw_email.len());
                 }
                 Ok(res) => {
-                    info!("✓ Saved email to PostgreSQL (fallback). Rows affected: {}", res.rows_affected());
+                    info!("✓ Saved email to PostgreSQL (fallback). Rows affected: {} [inst: {}]", res.rows_affected(), instance.as_str());
                 }
-            }
-
-            if heartbeat_url.is_some() {
-                send_heartbeat(&heartbeat_url.as_ref().unwrap()).await;
             }
 
             return Ok(());
@@ -530,7 +549,7 @@ async fn process_email(
             let html_body = String::new();
 
             let to_addrs_vec = vec![recipient_email.clone()];
-            info!("Saving to PostgreSQL (fallback): mailbox_owner={}, mailbox=INBOX, subject={}, from={}, size={}", recipient_email, subject, from_address, text_body.len());
+            info!("Saving to PostgreSQL (fallback): mailbox_owner={}, mailbox=INBOX, subject={}, from={}, size={} [inst: {}]", recipient_email, subject, from_address, text_body.len(), instance.as_str());
 
             let insert_res = sqlx::query(
                 "INSERT INTO emails (mailbox_owner, mailbox, subject, body, html, from_addr, to_addrs, size, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())"
@@ -552,12 +571,8 @@ async fn process_email(
                     error!("Attempted insert values: mailbox_owner={}, subject={}, from={}, to_addrs={:?}, size={}", recipient_email, subject, from_address, to_addrs_vec, raw_email_owned.len());
                 }
                 Ok(res) => {
-                    info!("✓ Saved email to PostgreSQL (fallback). Rows affected: {}", res.rows_affected());
+                    info!("✓ Saved email to PostgreSQL (fallback). Rows affected: {} [inst: {}]", res.rows_affected(), instance.as_str());
                 }
-            }
-
-            if heartbeat_url.is_some() {
-                send_heartbeat(&heartbeat_url.as_ref().unwrap()).await;
             }
 
             return Ok(());
@@ -565,7 +580,7 @@ async fn process_email(
     };
 
     let to_addrs_vec = vec![recipient_email.clone()];
-    info!("Saving to PostgreSQL: mailbox_owner={}, mailbox=INBOX, subject={}, from={}, text_len={}, html_len={}", recipient_email, subject, from_address, text_body.len(), html_body.len());
+    info!("Saving to PostgreSQL: mailbox_owner={}, mailbox=INBOX, subject={}, from={}, text_len={}, html_len={} [inst: {}]", recipient_email, subject, from_address, text_body.len(), html_body.len(), instance.as_str());
 
     match sqlx::query(
         "INSERT INTO emails (mailbox_owner, mailbox, subject, body, html, from_addr, to_addrs, size, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())"
@@ -581,18 +596,14 @@ async fn process_email(
     .execute(postgres_pool)
     .await {
         Ok(result) => {
-            info!("✓ Saved email to PostgreSQL. Rows affected: {}", result.rows_affected());
-            info!("✓ Email text size: {} bytes, html size: {} bytes", text_body.len(), html_body.len());
+            info!("✓ Saved email to PostgreSQL. Rows affected: {} [inst: {}]", result.rows_affected(), instance.as_str());
+            info!("✓ Email text size: {} bytes, html size: {} bytes [inst: {}]", text_body.len(), html_body.len(), instance.as_str());
         }
         Err(e) => {
             error!("Failed to save email to PostgreSQL: {}", e);
             error!("PostgreSQL error details: {:?}", e);
             error!("Attempted insert values: mailbox_owner={}, subject={}, from={}, to_addrs={:?}, text_len={}, html_len={}", recipient_email, subject, from_address, to_addrs_vec, text_body.len(), html_body.len());
         }
-    }
-
-    if heartbeat_url.is_some() {
-        send_heartbeat(&heartbeat_url.as_ref().unwrap()).await;
     }
 
     Ok(())
@@ -652,7 +663,7 @@ fn strip_email_headers(raw_email: &str) -> String {
 }
 
 // PostgreSQL-based inbox management (replaces Supabase)
-async fn get_or_create_inbox_pg(postgres_pool: &PgPool, email: &str) -> anyhow::Result<String> {
+async fn get_or_create_inbox_pg(postgres_pool: &PgPool, email: &str, instance: Arc<String>) -> anyhow::Result<String> {
     // Try to find existing inbox
     let result = sqlx::query_as::<_, (String,)>(
         "SELECT id::text FROM inbox WHERE email_address = $1"
@@ -677,7 +688,7 @@ async fn get_or_create_inbox_pg(postgres_pool: &PgPool, email: &str) -> anyhow::
 
             match insert_result {
                 Ok((inbox_id,)) => {
-                    info!("✓ Created inbox in PostgreSQL: {}", inbox_id);
+                    info!("✓ Created inbox in PostgreSQL: {} [inst: {}]", inbox_id, instance.as_str());
                     Ok(inbox_id)
                 }
                 Err(e) => {
@@ -689,21 +700,6 @@ async fn get_or_create_inbox_pg(postgres_pool: &PgPool, email: &str) -> anyhow::
         Err(e) => {
             error!("Error checking inbox in PostgreSQL: {:?}", e);
             Err(anyhow::anyhow!("PostgreSQL inbox query error: {}", e))
-        }
-    }
-}
-
-async fn send_heartbeat(url: &str) {
-    match Client::new().get(url).send().await {
-        Ok(response) => {
-            if response.status().is_success() {
-                info!("✓ Heartbeat sent successfully");
-            } else {
-                warn!("⚠ Heartbeat failed: {}", response.status());
-            }
-        },
-        Err(e) => {
-            error!("✗ Heartbeat error: {}", e);
         }
     }
 }
