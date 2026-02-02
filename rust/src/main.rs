@@ -1,7 +1,7 @@
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpListener,
-    sync::{Semaphore, Mutex, RwLock},
+    sync::{Semaphore, Mutex, RwLock, mpsc},
     time::Duration,
 };
 use std::{collections::{HashSet}, env, sync::{Arc, atomic::{AtomicUsize, Ordering}}};
@@ -33,11 +33,25 @@ struct BansCache {
 }
 
 // PostgreSQL inbox structure (no longer using Supabase)
-#[derive(Debug, Deserialize, Serialize, sqlx::FromRow)]
+#[allow(dead_code)]
+#[derive(Debug, Deserialize, Serialize, sqlx::FromRow, Clone)]
 struct Inbox {
     id: String,
     email_address: String,
     user_id: Option<String>,
+}
+
+// Email batch insert structure
+#[derive(Debug, Clone)]
+struct EmailInsert {
+    mailbox_owner: String,
+    mailbox: String,
+    subject: String,
+    body: String,
+    html: String,
+    from_addr: String,
+    to_addrs: Vec<String>,
+    size: i64,
 }
 
 // Supabase domain structure
@@ -88,6 +102,7 @@ async fn main() -> anyhow::Result<()> {
     // Create PostgreSQL connection pool for temporary emails
     let postgres_pool = PgPoolOptions::new()
         .max_connections(50)
+        .acquire_timeout(Duration::from_secs(10))
         .connect(&database_url)
         .await?;
     info!("✓ Connected to PostgreSQL database");
@@ -100,6 +115,37 @@ async fn main() -> anyhow::Result<()> {
 
     // Bans cache (email exact, contains, domain)
     let bans_cache: Arc<RwLock<BansCache>> = Arc::new(RwLock::new(BansCache::default()));
+    
+    // Create batch insert channel for database efficiency
+    let (batch_tx, mut batch_rx) = mpsc::channel::<EmailInsert>(500);
+    
+    // Spawn batch insert worker
+    let postgres_pool_batch = postgres_pool.clone();
+    tokio::spawn(async move {
+        let mut buffer = Vec::with_capacity(50);
+        let mut flush_interval = tokio::time::interval(Duration::from_millis(500));
+        
+        loop {
+            tokio::select! {
+                Some(email) = batch_rx.recv() => {
+                    buffer.push(email);
+                    
+                    // Flush if buffer is full
+                    if buffer.len() >= 50 {
+                        flush_batch(&postgres_pool_batch, &mut buffer).await;
+                    }
+                }
+                _ = flush_interval.tick() => {
+                    // Flush periodically
+                    if !buffer.is_empty() {
+                        flush_batch(&postgres_pool_batch, &mut buffer).await;
+                    }
+                }
+            }
+        }
+    });
+    
+    let batch_sender = Arc::new(batch_tx);
     
     // Initialize domain whitelist from Supabase (if enabled)
     if use_supabase_domains {
@@ -179,6 +225,7 @@ async fn main() -> anyhow::Result<()> {
         let semaphore = semaphore.clone();
         let queue_counter = queue_counter.clone();
         let connection_counter = connection_counter.clone();
+        let batch_sender = batch_sender.clone();
 
         tokio::spawn(async move {
             let _permit = semaphore.acquire().await.unwrap();
@@ -198,7 +245,7 @@ async fn main() -> anyhow::Result<()> {
             };
 
             info!("[SMTP IN] New connection from {} -> local [Queue: {}/{}] [inst: {}]", addr, queue_size, max_queue, instance.as_str());
-            if let Err(e) = handle_smtp(socket, postgres_pool, whitelist, bans_cache, instance.clone()).await {
+            if let Err(e) = handle_smtp(socket, postgres_pool, whitelist, bans_cache, batch_sender, instance.clone()).await {
                 error!("Error handling {}: {:?}", addr, e);
             }
 
@@ -218,8 +265,11 @@ async fn handle_smtp(
     postgres_pool: PgPool,
     whitelist: Arc<Mutex<HashSet<String>>>,
     bans_cache: Arc<RwLock<BansCache>>,
+    batch_sender: Arc<mpsc::Sender<EmailInsert>>,
     instance: Arc<String>,
 ) -> anyhow::Result<()> {
+    // Set timeouts to prevent hanging connections (30 seconds idle timeout)
+    socket.set_nodelay(true)?;
     let (reader, mut writer) = socket.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
@@ -241,7 +291,7 @@ async fn handle_smtp(
             if cmd == "." {
                 data_mode = false;
                 info!("[SMTP IN] DATA stream completed [inst: {}]", instance.as_str());
-                match process_email(&email_data, &rcpt_to, &mail_from, &postgres_pool, &whitelist, &bans_cache, instance.clone()).await {
+                match process_email(&email_data, &rcpt_to, &mail_from, &postgres_pool, &whitelist, &bans_cache, &batch_sender, instance.clone()).await {
                     Ok(_) => {
                         writer.write_all(b"250 Ok: Message accepted\r\n").await?;
                         info!("✓ Email processed successfully [inst: {}]", instance.as_str());
@@ -337,6 +387,7 @@ async fn process_email(
     postgres_pool: &PgPool,
     whitelist: &Arc<Mutex<HashSet<String>>>,
     bans_cache: &Arc<RwLock<BansCache>>,
+    batch_sender: &Arc<mpsc::Sender<EmailInsert>>,
     instance: Arc<String>,
 ) -> anyhow::Result<()> {
     // Join all email data lines with CRLF (SMTP standard)
@@ -398,23 +449,22 @@ async fn process_email(
             if opt.is_some() {
                 // Save directly into Postgres emails table for private users using the raw email as body
                 let to_addrs_vec_local = vec![recipient_email.clone()];
-                let insert_res = sqlx::query(
-                    "INSERT INTO emails (mailbox_owner, mailbox, subject, body, html, from_addr, to_addrs, size, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())"
-                )
-                .bind(&recipient_email)
-                .bind("INBOX")
-                .bind(&subject)
-                .bind(&raw_email)
-                .bind(None::<String>)
-                .bind(&from_address)
-                .bind(&to_addrs_vec_local)
-                .bind(raw_email.len() as i64)
-                .execute(postgres_pool)
-                .await;
-
-                match insert_res {
-                    Ok(_res) => {
-                        info!("✓ Saved email for private user in Postgres: {} -> {} [inst: {}]", from_address, recipient_email, instance.as_str());
+                
+                // Send to batch processor instead of direct insert
+                let email_insert = EmailInsert {
+                    mailbox_owner: recipient_email.clone(),
+                    mailbox: "INBOX".to_string(),
+                    subject: subject.clone(),
+                    body: raw_email.clone(),
+                    html: String::new(),
+                    from_addr: from_address.clone(),
+                    to_addrs: to_addrs_vec_local,
+                    size: raw_email.len() as i64,
+                };
+                
+                match batch_sender.send(email_insert).await {
+                    Ok(_) => {
+                        info!("✓ Queued email for private user (batch): {} -> {} [inst: {}]", from_address, recipient_email, instance.as_str());
                         // Update last_updated_at for the private_email row
                         let _ = sqlx::query("UPDATE private_email SET last_updated_at = NOW() WHERE email = $1")
                             .bind(&recipient_email)
@@ -424,7 +474,7 @@ async fn process_email(
                         return Ok(());
                     }
                     Err(e) => {
-                        error!("Failed to save private email to Postgres: {:?}", e);
+                        error!("Failed to queue private email for batch insert: {:?}", e);
                     }
                 }
             }
@@ -505,35 +555,26 @@ async fn process_email(
         Err(e) => {
             warn!("spawn_blocking failed, falling back to raw body: {}", e);
             // fallback: save raw as plain text
-            let subject = "No Subject".to_string();
             let text_body = raw_email.clone();
-            let html_body = String::new();
 
             let to_addrs_vec = vec![recipient_email.clone()];
             info!("Saving to PostgreSQL (fallback): mailbox_owner={}, mailbox=INBOX, subject={}, from={}, size={} [inst: {}]", recipient_email, subject, from_address, text_body.len(), instance.as_str());
 
-            let insert_res = sqlx::query(
-                "INSERT INTO emails (mailbox_owner, mailbox, subject, body, html, from_addr, to_addrs, size, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())"
-            )
-            .bind(&recipient_email)
-            .bind("INBOX")
-            .bind(&subject)
-            .bind(&raw_email)
-            .bind(&html_body)
-            .bind(&from_address)
-            .bind(&to_addrs_vec)
-            .bind(raw_email.len() as i64)
-            .execute(postgres_pool)
-            .await;
-
-            match insert_res {
-                Err(e) => {
-                    error!("Failed to save email to PostgreSQL (fallback): {}", e);
-                    error!("Attempted insert values: mailbox_owner={}, subject={}, from={}, to_addrs={:?}, size={}", recipient_email, subject, from_address, to_addrs_vec, raw_email.len());
-                }
-                Ok(res) => {
-                    info!("✓ Saved email to PostgreSQL (fallback). Rows affected: {} [inst: {}]", res.rows_affected(), instance.as_str());
-                }
+            let email_insert = EmailInsert {
+                mailbox_owner: recipient_email.clone(),
+                mailbox: "INBOX".to_string(),
+                subject: subject.clone(),
+                body: raw_email.clone(),
+                html: String::new(),
+                from_addr: from_address.clone(),
+                to_addrs: to_addrs_vec,
+                size: raw_email.len() as i64,
+            };
+            
+            if let Err(e) = batch_sender.send(email_insert).await {
+                error!("Failed to queue email for batch insert (fallback): {}", e);
+            } else {
+                info!("✓ Queued email (fallback batch). [inst: {}]", instance.as_str());
             }
 
             return Ok(());
@@ -546,33 +587,25 @@ async fn process_email(
             warn!("mailparse failed to parse message, falling back to raw body: {}", e);
             // fallback: save raw as plain text
             let text_body = raw_email_owned.clone();
-            let html_body = String::new();
 
             let to_addrs_vec = vec![recipient_email.clone()];
             info!("Saving to PostgreSQL (fallback): mailbox_owner={}, mailbox=INBOX, subject={}, from={}, size={} [inst: {}]", recipient_email, subject, from_address, text_body.len(), instance.as_str());
 
-            let insert_res = sqlx::query(
-                "INSERT INTO emails (mailbox_owner, mailbox, subject, body, html, from_addr, to_addrs, size, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())"
-            )
-            .bind(&recipient_email)
-            .bind("INBOX")
-            .bind(&subject)
-            .bind(&raw_email_owned)
-            .bind(&html_body)
-            .bind(&from_address)
-            .bind(&to_addrs_vec)
-            .bind(raw_email_owned.len() as i64)
-            .execute(postgres_pool)
-            .await;
-
-            match insert_res {
-                Err(e) => {
-                    error!("Failed to save email to PostgreSQL (fallback): {}", e);
-                    error!("Attempted insert values: mailbox_owner={}, subject={}, from={}, to_addrs={:?}, size={}", recipient_email, subject, from_address, to_addrs_vec, raw_email_owned.len());
-                }
-                Ok(res) => {
-                    info!("✓ Saved email to PostgreSQL (fallback). Rows affected: {} [inst: {}]", res.rows_affected(), instance.as_str());
-                }
+            let email_insert = EmailInsert {
+                mailbox_owner: recipient_email.clone(),
+                mailbox: "INBOX".to_string(),
+                subject: subject.clone(),
+                body: raw_email_owned.clone(),
+                html: String::new(),
+                from_addr: from_address.clone(),
+                to_addrs: to_addrs_vec,
+                size: raw_email_owned.len() as i64,
+            };
+            
+            if let Err(e) = batch_sender.send(email_insert).await {
+                error!("Failed to queue email for batch insert (fallback): {}", e);
+            } else {
+                info!("✓ Queued email (fallback batch). [inst: {}]", instance.as_str());
             }
 
             return Ok(());
@@ -582,27 +615,24 @@ async fn process_email(
     let to_addrs_vec = vec![recipient_email.clone()];
     info!("Saving to PostgreSQL: mailbox_owner={}, mailbox=INBOX, subject={}, from={}, text_len={}, html_len={} [inst: {}]", recipient_email, subject, from_address, text_body.len(), html_body.len(), instance.as_str());
 
-    match sqlx::query(
-        "INSERT INTO emails (mailbox_owner, mailbox, subject, body, html, from_addr, to_addrs, size, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())"
-    )
-    .bind(&recipient_email)
-    .bind("INBOX")
-    .bind(&subject)
-    .bind(&text_body)
-    .bind(&html_body)
-    .bind(&from_address)
-    .bind(&to_addrs_vec)
-    .bind(raw_email_owned.len() as i64)
-    .execute(postgres_pool)
-    .await {
-        Ok(result) => {
-            info!("✓ Saved email to PostgreSQL. Rows affected: {} [inst: {}]", result.rows_affected(), instance.as_str());
+    let email_insert = EmailInsert {
+        mailbox_owner: recipient_email.clone(),
+        mailbox: "INBOX".to_string(),
+        subject: subject.clone(),
+        body: text_body.clone(),
+        html: html_body.clone(),
+        from_addr: from_address.clone(),
+        to_addrs: to_addrs_vec.clone(),
+        size: raw_email_owned.len() as i64,
+    };
+    
+    match batch_sender.send(email_insert).await {
+        Ok(_) => {
+            info!("✓ Queued email for batch insert [inst: {}]", instance.as_str());
             info!("✓ Email text size: {} bytes, html size: {} bytes [inst: {}]", text_body.len(), html_body.len(), instance.as_str());
         }
         Err(e) => {
-            error!("Failed to save email to PostgreSQL: {}", e);
-            error!("PostgreSQL error details: {:?}", e);
-            error!("Attempted insert values: mailbox_owner={}, subject={}, from={}, to_addrs={:?}, text_len={}, html_len={}", recipient_email, subject, from_address, to_addrs_vec, text_body.len(), html_body.len());
+            error!("Failed to queue email for batch insert: {}", e);
         }
     }
 
@@ -783,7 +813,8 @@ async fn poll_domain_updates(
     whitelist: Arc<Mutex<HashSet<String>>>,
 ) {
     let client = Client::new();
-    let mut poll_interval = tokio::time::interval(Duration::from_secs(60));
+    // Reduced from 60s to 120s for 1 vCore optimization
+    let mut poll_interval = tokio::time::interval(Duration::from_secs(120));
     
     loop {
         poll_interval.tick().await;
@@ -894,7 +925,8 @@ async fn load_bans(supabase_url: &str, supabase_key: &str, bans_cache: Arc<RwLoc
 }
 
 async fn poll_bans(supabase_url: String, supabase_key: String, bans_cache: Arc<RwLock<BansCache>>) {
-    let mut poll_interval = tokio::time::interval(Duration::from_secs(30));
+    // Reduced from 30s to 60s for 1 vCore optimization
+    let mut poll_interval = tokio::time::interval(Duration::from_secs(60));
     // Initial load
     load_bans(&supabase_url, &supabase_key, bans_cache.clone()).await;
     loop {
@@ -928,4 +960,53 @@ async fn is_email_banned(from_lower: &str, bans_cache: &Arc<RwLock<BansCache>>) 
         }
     }
     false
+}
+
+// Batch flush function for efficient bulk inserts
+async fn flush_batch(pool: &PgPool, buffer: &mut Vec<EmailInsert>) {
+    if buffer.is_empty() {
+        return;
+    }
+    
+    info!("🔄 Flushing batch of {} emails to database", buffer.len());
+    
+    // Use a transaction for batch insert
+    let mut tx = match pool.begin().await {
+        Ok(t) => t,
+        Err(e) => {
+            error!("Failed to start transaction for batch insert: {}", e);
+            buffer.clear();
+            return;
+        }
+    };
+
+    let batch_len = buffer.len();
+    let mut query = sqlx::QueryBuilder::new(
+        "INSERT INTO emails (mailbox_owner, mailbox, subject, body, html, from_addr, to_addrs, size, created_at) "
+    );
+    query.push_values(buffer.iter(), |mut b, email| {
+        b.push_bind(&email.mailbox_owner)
+            .push_bind(&email.mailbox)
+            .push_bind(&email.subject)
+            .push_bind(&email.body)
+            .push_bind(&email.html)
+            .push_bind(&email.from_addr)
+            .push_bind(&email.to_addrs)
+            .push_bind(email.size)
+            .push("NOW()");
+    });
+
+    let insert_result = query.build().execute(&mut *tx).await;
+    buffer.clear();
+
+    match insert_result {
+        Ok(_) => match tx.commit().await {
+            Ok(_) => info!("✓ Batch committed: {} emails", batch_len),
+            Err(e) => error!("Failed to commit batch transaction: {}", e),
+        },
+        Err(e) => {
+            error!("Failed to insert batch: {}", e);
+            let _ = tx.rollback().await;
+        }
+    }
 }
