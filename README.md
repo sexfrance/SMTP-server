@@ -82,6 +82,7 @@ This server is designed as a **receive-only SMTP server** that:
 
 - ✅ **Production-Ready**: Currently handling Cybertemp's email traffic
 - ✅ **High Performance**: Async Rust with Tokio for concurrent connections and super fast
+- ✅ **Batch Email Processing**: Emails buffered and inserted in multi-row batches for optimal database throughput
 - ✅ **Dual Email System**: Supports both temporary and private emails
 - ✅ **Domain Whitelisting**: Accept emails only for configured domains
 - ✅ **Ban System**: Block emails from specific senders/domains
@@ -91,7 +92,7 @@ This server is designed as a **receive-only SMTP server** that:
 - ✅ **Connection Pooling**: Efficient database connections
 - ✅ **Queue Management**: Prevents server overload with request limits
 - ✅ **Heartbeat Monitoring**: Optional uptime monitoring endpoint
-- ✅ **Real-time Domain Updates**: Polls for domain/ban updates every 30-60s
+- ✅ **Real-time Domain Updates**: Polls for domain/ban updates every 60-120s
 - ✅ **Graceful Error Handling**: Detailed logging with tracing
 
 ---
@@ -299,11 +300,13 @@ sudo systemctl status cybertemp-smtp
 3. **Domain Check**: Recipient domain is validated against whitelist
 4. **Ban Check**: Sender and domain are checked against ban list
 5. **Email Receipt**: Server accepts email data until `.` terminator
-6. **Parsing**: Email is parsed using `mailparse` crate
-7. **Storage Decision**:
+6. **Parsing**: Email is parsed using `mailparse` crate in parallel with inbox creation
+7. **Batch Queueing**: Email is queued to batch processor via channel (mpsc)
+8. **Batch Processing**: When buffer reaches 50 emails or 500ms timeout, all emails are inserted in a single multi-row INSERT statement via transaction
+9. **Storage Decision**:
    - If recipient is in `private_email` table → Store in PostgreSQL `emails` table
    - Otherwise → Store in PostgreSQL as temporary email + create PostgreSQL inbox entry
-8. **Response**: Server responds with `250 Ok: Message accepted`
+10. **Response**: Server responds with `250 Ok: Message accepted` (immediately, doesn't wait for DB batch commit)
 
 ### Domain Whitelisting
 
@@ -324,7 +327,7 @@ Protects against spam and abuse:
   - `exact` match: Must match exactly
   - `contains` match: Blocks if sender contains substring
 - **Domain bans**: Block entire sending domains
-- **Real-time updates**: Ban list refreshes every 30 seconds
+- **Real-time updates**: Ban list refreshes every 60 seconds
 
 ---
 
@@ -457,6 +460,14 @@ RUST_LOG=debug ./target/release/cybertemp_smtp
 ## 📜 ChangeLog
 
 ```diff
+v0.4.0 ⋮ 02/02/2025
++ Batch insert optimization with multi-row INSERT statements
++ Channel-based email buffering (mpsc) for SMTP-DB decoupling
++ TCP_NODELAY enabled for faster socket communication
++ Reduced polling intervals (domain: 120s, bans: 60s)
++ QueryBuilder for efficient bulk inserts with transactions
++ Performance optimized for 1 vCore servers
+
 v0.3.0 ⋮ 11/01/2025
 + Comprehensive documentation rewrite
 + Clarified private email feature is optional
