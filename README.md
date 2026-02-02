@@ -158,13 +158,13 @@ HEARTBEAT_URL=https://your-monitoring-service.com/ping
 
 ### Environment Variables Explained
 
-| Variable                    | Required | Default | Description                                     |
-| --------------------------- | -------- | ------- | ----------------------------------------------- |
-| `DATABASE_URL`              | ✅ Yes   | -       | PostgreSQL connection string for storing emails |
-| `SMTP_RECEIVE_PORT`         | ❌ No    | 25      | SMTP port (default: 25)                         |
-| `HEARTBEAT_URL`             | ❌ No    | -       | Uptime monitoring ping URL                      |
-| `USE_SUPABASE_BANS`         | ❌ No    | true    | Enable/disable Supabase ban system              |
-| `USE_SUPABASE_DOMAINS`      | ❌ No    | true    | Enable/disable Supabase domain whitelist        |
+| Variable               | Required | Default | Description                                     |
+| ---------------------- | -------- | ------- | ----------------------------------------------- |
+| `DATABASE_URL`         | ✅ Yes   | -       | PostgreSQL connection string for storing emails |
+| `SMTP_RECEIVE_PORT`    | ❌ No    | 25      | SMTP port (default: 25)                         |
+| `HEARTBEAT_URL`        | ❌ No    | -       | Uptime monitoring ping URL                      |
+| `USE_SUPABASE_BANS`    | ❌ No    | true    | Enable/disable Supabase ban system              |
+| `USE_SUPABASE_DOMAINS` | ❌ No    | true    | Enable/disable Supabase domain whitelist        |
 
 ---
 
