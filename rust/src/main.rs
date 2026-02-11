@@ -122,55 +122,48 @@ async fn main() -> anyhow::Result<()> {
     // Create batch insert channel for database efficiency
     let (batch_tx, mut batch_rx) = mpsc::channel::<EmailInsert>(1000);
     
-    // Spawn batch insert worker with dynamic timing
+    // Spawn batch insert worker
     let postgres_pool_batch = postgres_pool.clone();
-    tokio::spawn(async move {
-        let mut buffer = Vec::with_capacity(75);
+    let batch_handle = tokio::spawn(async move {
+        let mut buffer: Vec<EmailInsert> = Vec::with_capacity(75);
         let mut flush_interval = tokio::time::interval(Duration::from_millis(100));
         flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut last_flush = tokio::time::Instant::now();
         
         loop {
             tokio::select! {
-                Some(email) = batch_rx.recv() => {
-                    buffer.push(email);
-                    
-                    // Flush immediately if buffer is full
-                    if buffer.len() >= 50 {
-                        flush_batch(&postgres_pool_batch, &mut buffer).await;
-                        last_flush = tokio::time::Instant::now();
+                result = batch_rx.recv() => {
+                    match result {
+                        Some(email) => {
+                            buffer.push(email);
+                            // Flush immediately if buffer is full
+                            if buffer.len() >= 50 {
+                                flush_batch(&postgres_pool_batch, &mut buffer).await;
+                            }
+                        }
+                        None => {
+                            // Channel closed, flush remaining and exit
+                            if !buffer.is_empty() {
+                                flush_batch(&postgres_pool_batch, &mut buffer).await;
+                            }
+                            warn!("Batch worker: channel closed, shutting down");
+                            break;
+                        }
                     }
                 }
                 _ = flush_interval.tick() => {
+                    // Always flush if buffer has any items
                     if !buffer.is_empty() {
-                        let buffer_size = buffer.len();
-                        let elapsed = last_flush.elapsed().as_millis() as u64;
-                        
-                        // Fast batching - low latency with reasonable efficiency
-                        let timeout_ms = if buffer_size >= 20 {
-                            // 20+ emails: wait 100ms max
-                            100
-                        } else if buffer_size >= 10 {
-                            // 10-19 emails: wait 75ms
-                            75
-                        } else if buffer_size >= 5 {
-                            // 5-9 emails: wait 50ms
-                            50
-                        } else {
-                            // 1-4 emails: flush after 25ms
-                            25
-                        };
-                        
-                        // Flush if timeout reached OR buffer nearly full
-                        if elapsed >= timeout_ms || buffer_size >= 45 {
-                            flush_batch(&postgres_pool_batch, &mut buffer).await;
-                            last_flush = tokio::time::Instant::now();
-                        }
-                    } else {
-                        last_flush = tokio::time::Instant::now();
+                        flush_batch(&postgres_pool_batch, &mut buffer).await;
                     }
                 }
             }
+        }
+    });
+    
+    // Monitor batch worker for panics
+    tokio::spawn(async move {
+        if let Err(e) = batch_handle.await {
+            error!("CRITICAL: Batch insert worker panicked: {:?}", e);
         }
     });
     
@@ -913,19 +906,19 @@ async fn flush_batch(pool: &PgPool, buffer: &mut Vec<EmailInsert>) {
         return;
     }
     
-    info!("🔄 Flushing batch of {} emails to database", buffer.len());
+    let batch_len = buffer.len();
+    info!("🔄 Flushing batch of {} emails to database", batch_len);
     
     // Use a transaction for batch insert
     let mut tx = match pool.begin().await {
         Ok(t) => t,
         Err(e) => {
-            error!("Failed to start transaction for batch insert: {}", e);
-            buffer.clear();
+            error!("Failed to start transaction for batch insert: {} - will retry on next flush", e);
+            // Don't clear buffer - will retry on next tick
             return;
         }
     };
 
-    let batch_len = buffer.len();
     let mut query = sqlx::QueryBuilder::new(
         "INSERT INTO emails (mailbox_owner, mailbox, subject, body, html, from_addr, to_addrs, size, created_at) "
     );
@@ -941,17 +934,23 @@ async fn flush_batch(pool: &PgPool, buffer: &mut Vec<EmailInsert>) {
             .push("NOW()");
     });
 
-    let insert_result = query.build().execute(&mut *tx).await;
-    buffer.clear();
-
-    match insert_result {
-        Ok(_) => match tx.commit().await {
-            Ok(_) => info!("✓ Batch committed: {} emails", batch_len),
-            Err(e) => error!("Failed to commit batch transaction: {}", e),
-        },
+    match query.build().execute(&mut *tx).await {
+        Ok(_) => {
+            match tx.commit().await {
+                Ok(_) => {
+                    info!("✓ Batch committed: {} emails saved", batch_len);
+                    buffer.clear();
+                }
+                Err(e) => {
+                    error!("Failed to commit batch transaction: {} - emails may need manual check", e);
+                    buffer.clear(); // Clear to avoid potential duplicates
+                }
+            }
+        }
         Err(e) => {
-            error!("Failed to insert batch: {}", e);
+            error!("✗ Batch insert failed: {} - dropping {} emails to prevent infinite retry", e, batch_len);
             let _ = tx.rollback().await;
+            buffer.clear();
         }
     }
 }
