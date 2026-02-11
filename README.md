@@ -82,6 +82,7 @@ This server is designed as a **high-performance receive-only SMTP server** that:
 ```
 
 **Performance Characteristics:**
+
 - SMTP Response: <1ms (instant acceptance, background processing)
 - Email Parsing: 1-3ms (inline, no thread pool overhead)
 - Inbox Creation: 0-5ms (upsert, no SELECT query)
@@ -467,17 +468,17 @@ RUST_LOG=debug ./target/release/cybertemp_smtp
 
 ## 📊 Development Status
 
-| Component                     | Status               | Notes                                 |
-| ----------------------------- | -------------------- | ------------------------------------- |
-| **Rust Implementation**       | ✅ **Active**        | Production-ready, actively maintained |
-| **JavaScript Implementation** | ❌ **Abandoned**     | Not maintained, use Rust version      |
-| **PostgreSQL Storage**        | ✅ Production        | Stable and tested                     |
-| **Self-hosted Inboxes**       | ✅ Production        | No external dependencies              |
-| **Supabase Integration**      | ⚠️ Optional          | For advanced features only            |
-| **Private Email Feature**     | ⚠️ Optional          | Cybertemp-specific, not required      |
-| **Performance**               | ✅ **Optimized**     | 20x faster (v0.5.0)                   |
-| **Code Quality**              | ✅ Improved          | Recent refactoring & optimization     |
-| **Documentation**             | ✅ Complete          | You're reading it!                    |
+| Component                     | Status           | Notes                                 |
+| ----------------------------- | ---------------- | ------------------------------------- |
+| **Rust Implementation**       | ✅ **Active**    | Production-ready, actively maintained |
+| **JavaScript Implementation** | ❌ **Abandoned** | Not maintained, use Rust version      |
+| **PostgreSQL Storage**        | ✅ Production    | Stable and tested                     |
+| **Self-hosted Inboxes**       | ✅ Production    | No external dependencies              |
+| **Supabase Integration**      | ⚠️ Optional      | For advanced features only            |
+| **Private Email Feature**     | ⚠️ Optional      | Cybertemp-specific, not required      |
+| **Performance**               | ✅ **Optimized** | 20x faster (v0.5.0)                   |
+| **Code Quality**              | ✅ Improved      | Recent refactoring & optimization     |
+| **Documentation**             | ✅ Complete      | You're reading it!                    |
 
 ---
 
