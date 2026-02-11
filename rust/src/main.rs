@@ -101,8 +101,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Create PostgreSQL connection pool for temporary emails
     let postgres_pool = PgPoolOptions::new()
-        .max_connections(50)
-        .acquire_timeout(Duration::from_secs(10))
+        .max_connections(100)
+        .min_connections(10)
+        .acquire_timeout(Duration::from_secs(5))
+        .idle_timeout(Duration::from_secs(300))
+        .max_lifetime(Duration::from_secs(1800))
         .connect(&database_url)
         .await?;
     info!("✓ Connected to PostgreSQL database");
@@ -117,28 +120,54 @@ async fn main() -> anyhow::Result<()> {
     let bans_cache: Arc<RwLock<BansCache>> = Arc::new(RwLock::new(BansCache::default()));
     
     // Create batch insert channel for database efficiency
-    let (batch_tx, mut batch_rx) = mpsc::channel::<EmailInsert>(500);
+    let (batch_tx, mut batch_rx) = mpsc::channel::<EmailInsert>(1000);
     
-    // Spawn batch insert worker
+    // Spawn batch insert worker with dynamic timing
     let postgres_pool_batch = postgres_pool.clone();
     tokio::spawn(async move {
-        let mut buffer = Vec::with_capacity(50);
-        let mut flush_interval = tokio::time::interval(Duration::from_millis(500));
+        let mut buffer = Vec::with_capacity(75);
+        let mut flush_interval = tokio::time::interval(Duration::from_millis(100));
+        flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_flush = tokio::time::Instant::now();
         
         loop {
             tokio::select! {
                 Some(email) = batch_rx.recv() => {
                     buffer.push(email);
                     
-                    // Flush if buffer is full
+                    // Flush immediately if buffer is full
                     if buffer.len() >= 50 {
                         flush_batch(&postgres_pool_batch, &mut buffer).await;
+                        last_flush = tokio::time::Instant::now();
                     }
                 }
                 _ = flush_interval.tick() => {
-                    // Flush periodically
                     if !buffer.is_empty() {
-                        flush_batch(&postgres_pool_batch, &mut buffer).await;
+                        let buffer_size = buffer.len();
+                        let elapsed = last_flush.elapsed().as_millis() as u64;
+                        
+                        // Fast batching - low latency with reasonable efficiency
+                        let timeout_ms = if buffer_size >= 20 {
+                            // 20+ emails: wait 100ms max
+                            100
+                        } else if buffer_size >= 10 {
+                            // 10-19 emails: wait 75ms
+                            75
+                        } else if buffer_size >= 5 {
+                            // 5-9 emails: wait 50ms
+                            50
+                        } else {
+                            // 1-4 emails: flush after 25ms
+                            25
+                        };
+                        
+                        // Flush if timeout reached OR buffer nearly full
+                        if elapsed >= timeout_ms || buffer_size >= 45 {
+                            flush_batch(&postgres_pool_batch, &mut buffer).await;
+                            last_flush = tokio::time::Instant::now();
+                        }
+                    } else {
+                        last_flush = tokio::time::Instant::now();
                     }
                 }
             }
@@ -291,16 +320,32 @@ async fn handle_smtp(
             if cmd == "." {
                 data_mode = false;
                 info!("[SMTP IN] DATA stream completed [inst: {}]", instance.as_str());
-                match process_email(&email_data, &rcpt_to, &mail_from, &postgres_pool, &whitelist, &bans_cache, &batch_sender, instance.clone()).await {
-                    Ok(_) => {
-                        writer.write_all(b"250 Ok: Message accepted\r\n").await?;
-                        info!("✓ Email processed successfully [inst: {}]", instance.as_str());
-                    },
-                    Err(e) => {
+                let email_data_clone = email_data.clone();
+                let rcpt_to_clone = rcpt_to.clone();
+                let mail_from_clone = mail_from.clone();
+                let postgres_pool_clone = postgres_pool.clone();
+                let whitelist_clone = whitelist.clone();
+                let bans_cache_clone = bans_cache.clone();
+                let batch_sender_clone = batch_sender.clone();
+                let instance_clone = instance.clone();
+
+                tokio::spawn(async move {
+                    if let Err(e) = process_email(
+                        &email_data_clone,
+                        &rcpt_to_clone,
+                        &mail_from_clone,
+                        &postgres_pool_clone,
+                        &whitelist_clone,
+                        &bans_cache_clone,
+                        &batch_sender_clone,
+                        instance_clone,
+                    ).await {
                         error!("Failed to process email: {}", e);
-                        writer.write_all(b"451 Temporary failure in email processing\r\n").await?;
                     }
-                }
+                });
+
+                writer.write_all(b"250 Ok: Message accepted\r\n").await?;
+                info!("✓ Email accepted for processing [inst: {}]", instance.as_str());
                 email_data.clear();
             } else {
                 email_data.push(cmd.to_string());
@@ -486,14 +531,9 @@ async fn process_email(
 
     // Handle as temp email - save to PostgreSQL
 
-    // Get or create inbox and parse email in parallel
-    let raw_email_clone = raw_email.clone();
-    let ( _ , parsed_result ) = tokio::join!(
-        get_or_create_inbox_pg(postgres_pool, &recipient_email, instance.clone()),
-        tokio::task::spawn_blocking(move || {
-            let data = raw_email_clone;
-            let bodies_result = match parse_mail(data.as_bytes()) {
-                Ok(parsed) => {
+    // Parse email directly without spawn_blocking (overhead not worth it for small emails)
+    let (text_body, html_body) = match parse_mail(raw_email.as_bytes()) {
+        Ok(parsed) => {
                     let mut text_body = String::new();
                     let mut html_body = String::new();
 
@@ -538,82 +578,29 @@ async fn process_email(
 
                     if text_body.trim().is_empty() && html_body.trim().is_empty() {
                         // Strip headers from raw email to avoid saving signatures and metadata
-                        let body_only = strip_email_headers(&data);
+                        let body_only = strip_email_headers(&raw_email);
                         text_body = body_only;
                     }
 
-                    Ok((text_body, html_body))
-                }
-                Err(e) => Err(e)
-            };
-            (data, bodies_result)
-        })
-    );
-
-    let (raw_email_owned, bodies_result) = match parsed_result {
-        Ok((d, br)) => (d, br),
-        Err(e) => {
-            warn!("spawn_blocking failed, falling back to raw body: {}", e);
-            // fallback: save raw as plain text
-            let text_body = raw_email.clone();
-
-            let to_addrs_vec = vec![recipient_email.clone()];
-            info!("Saving to PostgreSQL (fallback): mailbox_owner={}, mailbox=INBOX, subject={}, from={}, size={} [inst: {}]", recipient_email, subject, from_address, text_body.len(), instance.as_str());
-
-            let email_insert = EmailInsert {
-                mailbox_owner: recipient_email.clone(),
-                mailbox: "INBOX".to_string(),
-                subject: subject.clone(),
-                body: raw_email.clone(),
-                html: String::new(),
-                from_addr: from_address.clone(),
-                to_addrs: to_addrs_vec,
-                size: raw_email.len() as i64,
-            };
-            
-            if let Err(e) = batch_sender.send(email_insert).await {
-                error!("Failed to queue email for batch insert (fallback): {}", e);
-            } else {
-                info!("✓ Queued email (fallback batch). [inst: {}]", instance.as_str());
-            }
-
-            return Ok(());
+            (text_body, html_body)
         }
-    };
-
-    let (text_body, html_body) = match bodies_result {
-        Ok((t, h)) => (t, h),
         Err(e) => {
             warn!("mailparse failed to parse message, falling back to raw body: {}", e);
             // fallback: save raw as plain text
-            let text_body = raw_email_owned.clone();
-
-            let to_addrs_vec = vec![recipient_email.clone()];
-            info!("Saving to PostgreSQL (fallback): mailbox_owner={}, mailbox=INBOX, subject={}, from={}, size={} [inst: {}]", recipient_email, subject, from_address, text_body.len(), instance.as_str());
-
-            let email_insert = EmailInsert {
-                mailbox_owner: recipient_email.clone(),
-                mailbox: "INBOX".to_string(),
-                subject: subject.clone(),
-                body: raw_email_owned.clone(),
-                html: String::new(),
-                from_addr: from_address.clone(),
-                to_addrs: to_addrs_vec,
-                size: raw_email_owned.len() as i64,
-            };
-            
-            if let Err(e) = batch_sender.send(email_insert).await {
-                error!("Failed to queue email for batch insert (fallback): {}", e);
-            } else {
-                info!("✓ Queued email (fallback batch). [inst: {}]", instance.as_str());
-            }
-
-            return Ok(());
+            (raw_email.clone(), String::new())
         }
     };
 
     let to_addrs_vec = vec![recipient_email.clone()];
     info!("Saving to PostgreSQL: mailbox_owner={}, mailbox=INBOX, subject={}, from={}, text_len={}, html_len={} [inst: {}]", recipient_email, subject, from_address, text_body.len(), html_body.len(), instance.as_str());
+
+    // Create inbox using upsert (no separate query needed)
+    let _ = sqlx::query(
+        "INSERT INTO inbox (email_address) VALUES ($1) ON CONFLICT (email_address) DO NOTHING"
+    )
+    .bind(&recipient_email)
+    .execute(postgres_pool)
+    .await;
 
     let email_insert = EmailInsert {
         mailbox_owner: recipient_email.clone(),
@@ -623,7 +610,7 @@ async fn process_email(
         html: html_body.clone(),
         from_addr: from_address.clone(),
         to_addrs: to_addrs_vec.clone(),
-        size: raw_email_owned.len() as i64,
+        size: raw_email.len() as i64,
     };
     
     match batch_sender.send(email_insert).await {
@@ -689,48 +676,6 @@ fn strip_email_headers(raw_email: &str) -> String {
         }
     } else {
         result
-    }
-}
-
-// PostgreSQL-based inbox management (replaces Supabase)
-async fn get_or_create_inbox_pg(postgres_pool: &PgPool, email: &str, instance: Arc<String>) -> anyhow::Result<String> {
-    // Try to find existing inbox
-    let result = sqlx::query_as::<_, (String,)>(
-        "SELECT id::text FROM inbox WHERE email_address = $1"
-    )
-    .bind(email)
-    .fetch_optional(postgres_pool)
-    .await;
-
-    match result {
-        Ok(Some((inbox_id,))) => {
-            // Inbox exists
-            return Ok(inbox_id);
-        }
-        Ok(None) => {
-            // Inbox doesn't exist, create it
-            let insert_result = sqlx::query_as::<_, (String,)>(
-                "INSERT INTO inbox (email_address) VALUES ($1) RETURNING id::text"
-            )
-            .bind(email)
-            .fetch_one(postgres_pool)
-            .await;
-
-            match insert_result {
-                Ok((inbox_id,)) => {
-                    info!("✓ Created inbox in PostgreSQL: {} [inst: {}]", inbox_id, instance.as_str());
-                    Ok(inbox_id)
-                }
-                Err(e) => {
-                    error!("Failed to create inbox in PostgreSQL: {:?}", e);
-                    Err(anyhow::anyhow!("PostgreSQL inbox creation error: {}", e))
-                }
-            }
-        }
-        Err(e) => {
-            error!("Error checking inbox in PostgreSQL: {:?}", e);
-            Err(anyhow::anyhow!("PostgreSQL inbox query error: {}", e))
-        }
     }
 }
 
