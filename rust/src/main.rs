@@ -417,6 +417,11 @@ fn extract_email(addr: &str) -> String {
     }
 }
 
+/// Strip null bytes and invalid characters that PostgreSQL TEXT columns reject
+fn sanitize_for_postgres(s: &str) -> String {
+    s.replace('\0', "")
+}
+
 // Process email content - FIXED VERSION
 async fn process_email(
     data: &Vec<String>,
@@ -430,6 +435,7 @@ async fn process_email(
 ) -> anyhow::Result<()> {
     // Join all email data lines with CRLF (SMTP standard)
     let raw_email = data.join("\r\n");
+    let raw_size = raw_email.len() as i64;
     
     info!("📧 Processing email - Raw size: {} bytes [inst: {}]", raw_email.len(), instance.as_str());
 
@@ -463,17 +469,68 @@ async fn process_email(
         return Ok(());
     }
 
-    // Parse subject from raw email headers using mailparse for proper MIME decoding
-    let subject = match parse_mail(raw_email.as_bytes()) {
+    // Parse email ONCE - extract subject, text body, and html body in a single pass
+    let (subject, text_body, html_body) = match parse_mail(raw_email.as_bytes()) {
         Ok(parsed) => {
-            parsed.get_headers().get_first_value("Subject")
-                .unwrap_or_else(|| "No Subject".to_string())
+            let subject = parsed.get_headers().get_first_value("Subject")
+                .unwrap_or_else(|| "No Subject".to_string());
+
+            let mut text_body = String::new();
+            let mut html_body = String::new();
+
+            if parsed.subparts.is_empty() {
+                if let Ok(b) = parsed.get_body() {
+                    if let Some(ct) = parsed.get_headers().get_first_value("Content-Type") {
+                        let ct_l = ct.to_lowercase();
+                        if ct_l.contains("text/html") {
+                            html_body = b;
+                        } else {
+                            text_body = b;
+                        }
+                    } else {
+                        text_body = b;
+                    }
+                }
+            } else {
+                for sub in &parsed.subparts {
+                    if let Some(ct) = sub.get_headers().get_first_value("Content-Type") {
+                        let ct_l = ct.to_lowercase();
+                        if ct_l.contains("text/html") {
+                            if let Ok(b) = sub.get_body() { html_body = b; }
+                        } else if ct_l.contains("text/plain") {
+                            if let Ok(b) = sub.get_body() { text_body = b; }
+                        } else if text_body.is_empty() {
+                            if let Ok(b) = sub.get_body() { text_body = b; }
+                        }
+                    } else if text_body.is_empty() {
+                        if let Ok(b) = sub.get_body() { text_body = b; }
+                    }
+                }
+            }
+
+            if text_body.trim().is_empty() {
+                if let Ok(b) = parsed.get_body() { text_body = b; }
+            }
+
+            if text_body.trim().is_empty() && html_body.trim().is_empty() {
+                let body_only = strip_email_headers(&raw_email);
+                text_body = body_only;
+            }
+
+            (subject, text_body, html_body)
         }
-        Err(_) => {
-            // Fallback to manual extraction if parsing fails
-            extract_subject_from_raw(&raw_email).unwrap_or_else(|| "No Subject".to_string())
+        Err(e) => {
+            warn!("mailparse failed: {} - using fallback [inst: {}]", e, instance.as_str());
+            let subject = extract_subject_from_raw(&raw_email).unwrap_or_else(|| "No Subject".to_string());
+            (subject, raw_email.clone(), String::new())
         }
     };
+
+    // Sanitize all strings to remove null bytes (PostgreSQL TEXT rejects \0)
+    let subject = sanitize_for_postgres(&subject);
+    let text_body = sanitize_for_postgres(&text_body);
+    let html_body = sanitize_for_postgres(&html_body);
+    let from_address = sanitize_for_postgres(&from_address);
     
     info!("✉ Parsed email for {} from {} - Subject: '{}' [inst: {}]", recipient_email, from_address, subject, instance.as_str());
 
@@ -485,30 +542,31 @@ async fn process_email(
     {
         Ok(opt) => {
             if opt.is_some() {
-                // Save directly into Postgres emails table for private users using the raw email as body
                 let to_addrs_vec_local = vec![recipient_email.clone()];
                 
-                // Send to batch processor instead of direct insert
                 let email_insert = EmailInsert {
                     mailbox_owner: recipient_email.clone(),
                     mailbox: "INBOX".to_string(),
                     subject: subject.clone(),
-                    body: raw_email.clone(),
+                    body: sanitize_for_postgres(&raw_email),
                     html: String::new(),
                     from_addr: from_address.clone(),
                     to_addrs: to_addrs_vec_local,
-                    size: raw_email.len() as i64,
+                    size: raw_size,
                 };
                 
                 match batch_sender.send(email_insert).await {
                     Ok(_) => {
                         info!("✓ Queued email for private user (batch): {} -> {} [inst: {}]", from_address, recipient_email, instance.as_str());
-                        // Update last_updated_at for the private_email row
-                        let _ = sqlx::query("UPDATE private_email SET last_updated_at = NOW() WHERE email = $1")
-                            .bind(&recipient_email)
-                            .execute(postgres_pool)
-                            .await;
-
+                        // Update last_updated_at in background (don't block)
+                        let pool = postgres_pool.clone();
+                        let email = recipient_email.clone();
+                        tokio::spawn(async move {
+                            let _ = sqlx::query("UPDATE private_email SET last_updated_at = NOW() WHERE email = $1")
+                                .bind(&email)
+                                .execute(&pool)
+                                .await;
+                        });
                         return Ok(());
                     }
                     Err(e) => {
@@ -518,98 +576,41 @@ async fn process_email(
             }
         }
         Err(e) => {
-            error!("Error checking private_email in Postgres: {:?}", e);
+            // Table might not exist - this is not fatal, continue to temp email path
+            warn!("private_email check failed (table may not exist): {:?} [inst: {}]", e, instance.as_str());
         }
     }
 
     // Handle as temp email - save to PostgreSQL
-
-    // Parse email directly without spawn_blocking (overhead not worth it for small emails)
-    let (text_body, html_body) = match parse_mail(raw_email.as_bytes()) {
-        Ok(parsed) => {
-                    let mut text_body = String::new();
-                    let mut html_body = String::new();
-
-                    // If no subparts, try top-level body
-                    if parsed.subparts.is_empty() {
-                        if let Ok(b) = parsed.get_body() {
-                            if let Some(ct) = parsed.get_headers().get_first_value("Content-Type") {
-                                let ct_l = ct.to_lowercase();
-                                if ct_l.contains("text/html") {
-                                    html_body = b;
-                                } else {
-                                    text_body = b;
-                                }
-                            } else {
-                                text_body = b;
-                            }
-                        }
-                    } else {
-                        for sub in &parsed.subparts {
-                            if let Some(ct) = sub.get_headers().get_first_value("Content-Type") {
-                                let ct_l = ct.to_lowercase();
-                                if ct_l.contains("text/html") {
-                                    if let Ok(b) = sub.get_body() { html_body = b; }
-                                } else if ct_l.contains("text/plain") {
-                                    if let Ok(b) = sub.get_body() { text_body = b; }
-                                } else {
-                                    if text_body.is_empty() {
-                                        if let Ok(b) = sub.get_body() { text_body = b; }
-                                    }
-                                }
-                            } else {
-                                if text_body.is_empty() {
-                                    if let Ok(b) = sub.get_body() { text_body = b; }
-                                }
-                            }
-                        }
-                    }
-
-                    if text_body.trim().is_empty() {
-                        if let Ok(b) = parsed.get_body() { text_body = b; }
-                    }
-
-                    if text_body.trim().is_empty() && html_body.trim().is_empty() {
-                        // Strip headers from raw email to avoid saving signatures and metadata
-                        let body_only = strip_email_headers(&raw_email);
-                        text_body = body_only;
-                    }
-
-            (text_body, html_body)
-        }
-        Err(e) => {
-            warn!("mailparse failed to parse message, falling back to raw body: {}", e);
-            // fallback: save raw as plain text
-            (raw_email.clone(), String::new())
-        }
-    };
-
     let to_addrs_vec = vec![recipient_email.clone()];
     info!("Saving to PostgreSQL: mailbox_owner={}, mailbox=INBOX, subject={}, from={}, text_len={}, html_len={} [inst: {}]", recipient_email, subject, from_address, text_body.len(), html_body.len(), instance.as_str());
 
-    // Create inbox using upsert (no separate query needed)
-    let _ = sqlx::query(
-        "INSERT INTO inbox (email_address) VALUES ($1) ON CONFLICT (email_address) DO NOTHING"
-    )
-    .bind(&recipient_email)
-    .execute(postgres_pool)
-    .await;
+    // Create inbox in background (don't block the queue path)
+    let pool_inbox = postgres_pool.clone();
+    let inbox_email = recipient_email.clone();
+    tokio::spawn(async move {
+        let _ = sqlx::query(
+            "INSERT INTO inbox (email_address) VALUES ($1) ON CONFLICT (email_address) DO NOTHING"
+        )
+        .bind(&inbox_email)
+        .execute(&pool_inbox)
+        .await;
+    });
 
     let email_insert = EmailInsert {
         mailbox_owner: recipient_email.clone(),
         mailbox: "INBOX".to_string(),
-        subject: subject.clone(),
-        body: text_body.clone(),
-        html: html_body.clone(),
-        from_addr: from_address.clone(),
-        to_addrs: to_addrs_vec.clone(),
-        size: raw_email.len() as i64,
+        subject,
+        body: text_body,
+        html: html_body,
+        from_addr: from_address,
+        to_addrs: to_addrs_vec,
+        size: raw_size,
     };
     
     match batch_sender.send(email_insert).await {
         Ok(_) => {
             info!("✓ Queued email for batch insert [inst: {}]", instance.as_str());
-            info!("✓ Email text size: {} bytes, html size: {} bytes [inst: {}]", text_body.len(), html_body.len(), instance.as_str());
         }
         Err(e) => {
             error!("Failed to queue email for batch insert: {}", e);
@@ -943,13 +944,44 @@ async fn flush_batch(pool: &PgPool, buffer: &mut Vec<EmailInsert>) {
                 }
                 Err(e) => {
                     error!("Failed to commit batch transaction: {} - emails may need manual check", e);
-                    buffer.clear(); // Clear to avoid potential duplicates
+                    buffer.clear();
                 }
             }
         }
         Err(e) => {
-            error!("✗ Batch insert failed: {} - dropping {} emails to prevent infinite retry", e, batch_len);
+            error!("✗ Batch insert failed: {} - falling back to individual inserts for {} emails", e, batch_len);
             let _ = tx.rollback().await;
+            
+            // Try inserting each email individually so one bad email doesn't kill the whole batch
+            let mut saved = 0usize;
+            let mut failed = 0usize;
+            for email in buffer.iter() {
+                let result = sqlx::query(
+                    "INSERT INTO emails (mailbox_owner, mailbox, subject, body, html, from_addr, to_addrs, size, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())"
+                )
+                .bind(&email.mailbox_owner)
+                .bind(&email.mailbox)
+                .bind(&email.subject)
+                .bind(&email.body)
+                .bind(&email.html)
+                .bind(&email.from_addr)
+                .bind(&email.to_addrs)
+                .bind(email.size)
+                .execute(pool)
+                .await;
+                
+                match result {
+                    Ok(_) => saved += 1,
+                    Err(e) => {
+                        failed += 1;
+                        error!("✗ Individual insert failed for {}: {}", email.mailbox_owner, e);
+                    }
+                }
+            }
+            if saved > 0 {
+                info!("✓ Individual fallback: saved {}, failed {}", saved, failed);
+            }
             buffer.clear();
         }
     }
