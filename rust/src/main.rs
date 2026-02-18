@@ -119,24 +119,30 @@ async fn main() -> anyhow::Result<()> {
     // Bans cache (email exact, contains, domain)
     let bans_cache: Arc<RwLock<BansCache>> = Arc::new(RwLock::new(BansCache::default()));
     
-    // Create batch insert channel for database efficiency
-    let (batch_tx, mut batch_rx) = mpsc::channel::<EmailInsert>(1000);
+    // Create batch insert channel for database efficiency (increased buffer)
+    let (batch_tx, mut batch_rx) = mpsc::channel::<EmailInsert>(2000);
     
     // Spawn batch insert worker
     let postgres_pool_batch = postgres_pool.clone();
     let batch_handle = tokio::spawn(async move {
-        let mut buffer: Vec<EmailInsert> = Vec::with_capacity(75);
-        let mut flush_interval = tokio::time::interval(Duration::from_millis(100));
+        // Increased buffer capacity to hold more emails before flushing
+        let mut buffer: Vec<EmailInsert> = Vec::with_capacity(200);
+        // Increased flush interval to 1s to allow batching
+        let mut flush_interval = tokio::time::interval(Duration::from_millis(1000));
         flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         
         loop {
             tokio::select! {
+                // Biased mode prioritizes receiving new emails (filling the batch)
+                // over the interval tick, assuming the channel has messages.
+                biased;
+
                 result = batch_rx.recv() => {
                     match result {
                         Some(email) => {
                             buffer.push(email);
-                            // Flush immediately if buffer is full
-                            if buffer.len() >= 50 {
+                            // Flush immediately if buffer is full (increased threshold)
+                            if buffer.len() >= 100 {
                                 flush_batch(&postgres_pool_batch, &mut buffer).await;
                             }
                         }
