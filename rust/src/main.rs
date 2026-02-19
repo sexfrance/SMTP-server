@@ -591,17 +591,7 @@ async fn process_email(
     let to_addrs_vec = vec![recipient_email.clone()];
     info!("Saving to PostgreSQL: mailbox_owner={}, mailbox=INBOX, subject={}, from={}, text_len={}, html_len={} [inst: {}]", recipient_email, subject, from_address, text_body.len(), html_body.len(), instance.as_str());
 
-    // Create inbox in background (don't block the queue path)
-    let pool_inbox = postgres_pool.clone();
-    let inbox_email = recipient_email.clone();
-    tokio::spawn(async move {
-        let _ = sqlx::query(
-            "INSERT INTO inbox (email_address) VALUES ($1) ON CONFLICT (email_address) DO NOTHING"
-        )
-        .bind(&inbox_email)
-        .execute(&pool_inbox)
-        .await;
-    });
+    // Inbox creation is now handled in batch within flush_batch to prevent connection starvation
 
     let email_insert = EmailInsert {
         mailbox_owner: recipient_email.clone(),
@@ -925,6 +915,28 @@ async fn flush_batch(pool: &PgPool, buffer: &mut Vec<EmailInsert>) {
             return;
         }
     };
+
+    // 1. Batch insert inboxes first (optimization: avoid single inserts per email)
+    // Extract unique mailbox owners to minimize duplicate work
+    let mut unique_owners: HashSet<&String> = HashSet::new();
+    for email in buffer.iter() {
+        unique_owners.insert(&email.mailbox_owner);
+    }
+
+    if !unique_owners.is_empty() {
+        let mut inbox_query = sqlx::QueryBuilder::new(
+            "INSERT INTO inbox (email_address) "
+        );
+        inbox_query.push_values(unique_owners.iter(), |mut b, owner| {
+            b.push_bind(owner);
+        });
+        inbox_query.push(" ON CONFLICT (email_address) DO NOTHING");
+
+        if let Err(e) = inbox_query.build().execute(&mut *tx).await {
+            error!("Failed to batch insert inboxes: {} - will retry individual inboxes in fallback", e);
+            // We continue here; if the transaction fails later, we fallback to individual anyway
+        }
+    }
 
     let mut query = sqlx::QueryBuilder::new(
         "INSERT INTO emails (mailbox_owner, mailbox, subject, body, html, from_addr, to_addrs, size, created_at) "

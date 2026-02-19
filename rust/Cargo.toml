@@ -17,4 +17,4 @@ tracing-subscriber = { version = "0.3", features = ["chrono"] }
 anyhow = "1.0"
 dotenv = "0.15"
 chrono = "0.4"
-sqlx = { version = "0.7", features = ["postgres", "runtime-tokio-rustls"] }
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls"] }
