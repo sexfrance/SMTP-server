@@ -101,7 +101,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Create PostgreSQL connection pool for temporary emails
     let postgres_pool = PgPoolOptions::new()
-        .max_connections(100)
+        .max_connections(40)
         .min_connections(10)
         .acquire_timeout(Duration::from_secs(5))
         .idle_timeout(Duration::from_secs(300))
@@ -120,15 +120,15 @@ async fn main() -> anyhow::Result<()> {
     let bans_cache: Arc<RwLock<BansCache>> = Arc::new(RwLock::new(BansCache::default()));
     
     // Create batch insert channel for database efficiency (increased buffer)
-    let (batch_tx, mut batch_rx) = mpsc::channel::<EmailInsert>(2000);
+    let (batch_tx, mut batch_rx) = mpsc::channel::<EmailInsert>(15000);
     
     // Spawn batch insert worker
     let postgres_pool_batch = postgres_pool.clone();
     let batch_handle = tokio::spawn(async move {
         // Increased buffer capacity to hold more emails before flushing
-        let mut buffer: Vec<EmailInsert> = Vec::with_capacity(200);
-        // Increased flush interval to 1s to allow batching
-        let mut flush_interval = tokio::time::interval(Duration::from_millis(1000));
+        let mut buffer: Vec<EmailInsert> = Vec::with_capacity(1000);
+        // Decreased flush interval to 50ms for near-instant latency
+        let mut flush_interval = tokio::time::interval(Duration::from_millis(50));
         flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         
         loop {
@@ -141,8 +141,8 @@ async fn main() -> anyhow::Result<()> {
                     match result {
                         Some(email) => {
                             buffer.push(email);
-                            // Flush immediately if buffer is full (increased threshold)
-                            if buffer.len() >= 100 {
+                            // Flush immediately if buffer is full (huge NVMe batch)
+                            if buffer.len() >= 500 {
                                 flush_batch(&postgres_pool_batch, &mut buffer).await;
                             }
                         }
@@ -236,8 +236,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Concurrency control
-    let semaphore = Arc::new(Semaphore::new(50));
-    let max_queue = 2000;
+    let semaphore = Arc::new(Semaphore::new(250));
+    let max_queue = 15000;
     let queue_counter = Arc::new(Mutex::new(0usize));
 
     // Start TCP listener for SMTP
