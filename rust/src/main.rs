@@ -476,6 +476,8 @@ async fn process_email(
     }
 
     // Parse email ONCE - extract subject, text body, and html body in a single pass
+    // Uses recursive MIME traversal so deeply nested parts (e.g.
+    // multipart/mixed → multipart/related → multipart/alternative → text/html) are found.
     let (subject, text_body, html_body) = match parse_mail(raw_email.as_bytes()) {
         Ok(parsed) => {
             let subject = parsed.get_headers().get_first_value("Subject")
@@ -484,11 +486,44 @@ async fn process_email(
             let mut text_body = String::new();
             let mut html_body = String::new();
 
+            // Recursive closure to walk the full MIME tree
+            fn walk_parts(part: &mailparse::ParsedMail, text: &mut String, html: &mut String) {
+                if let Some(ct) = part.get_headers().get_first_value("Content-Type") {
+                    let ct_l = ct.to_lowercase();
+                    if ct_l.starts_with("text/html") {
+                        if html.is_empty() {
+                            if let Ok(b) = part.get_body() { *html = b; }
+                        }
+                        return;
+                    } else if ct_l.starts_with("text/plain") {
+                        if text.is_empty() {
+                            if let Ok(b) = part.get_body() { *text = b; }
+                        }
+                        return;
+                    }
+                    // multipart/* → recurse into children
+                    if ct_l.starts_with("multipart/") {
+                        for sub in &part.subparts {
+                            walk_parts(sub, text, html);
+                        }
+                        return;
+                    }
+                }
+                // No Content-Type header or unrecognised type: try children first, then treat as text
+                if !part.subparts.is_empty() {
+                    for sub in &part.subparts {
+                        walk_parts(sub, text, html);
+                    }
+                } else if text.is_empty() {
+                    if let Ok(b) = part.get_body() { *text = b; }
+                }
+            }
+
             if parsed.subparts.is_empty() {
+                // Single-part message
                 if let Ok(b) = parsed.get_body() {
                     if let Some(ct) = parsed.get_headers().get_first_value("Content-Type") {
-                        let ct_l = ct.to_lowercase();
-                        if ct_l.contains("text/html") {
+                        if ct.to_lowercase().contains("text/html") {
                             html_body = b;
                         } else {
                             text_body = b;
@@ -498,19 +533,9 @@ async fn process_email(
                     }
                 }
             } else {
+                // Multi-part message: recurse through the full tree
                 for sub in &parsed.subparts {
-                    if let Some(ct) = sub.get_headers().get_first_value("Content-Type") {
-                        let ct_l = ct.to_lowercase();
-                        if ct_l.contains("text/html") {
-                            if let Ok(b) = sub.get_body() { html_body = b; }
-                        } else if ct_l.contains("text/plain") {
-                            if let Ok(b) = sub.get_body() { text_body = b; }
-                        } else if text_body.is_empty() {
-                            if let Ok(b) = sub.get_body() { text_body = b; }
-                        }
-                    } else if text_body.is_empty() {
-                        if let Ok(b) = sub.get_body() { text_body = b; }
-                    }
+                    walk_parts(sub, &mut text_body, &mut html_body);
                 }
             }
 
@@ -554,8 +579,8 @@ async fn process_email(
                     mailbox_owner: recipient_email.clone(),
                     mailbox: "INBOX".to_string(),
                     subject: subject.clone(),
-                    body: sanitize_for_postgres(&raw_email),
-                    html: String::new(),
+                    body: text_body.clone(),
+                    html: html_body.clone(),
                     from_addr: from_address.clone(),
                     to_addrs: to_addrs_vec_local,
                     size: raw_size,
