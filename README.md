@@ -47,7 +47,7 @@ This server is designed as a **high-performance receive-only SMTP server** that:
 - Stores temporary emails in PostgreSQL with intelligent batch inserts (50 emails @ 10-15ms)
 - Manages inboxes with optimized upsert queries (no redundant SELECT)
 - Supports private email accounts (optional feature used by Cybertemp)
-- Implements domain whitelisting and email/domain banning (optional Supabase integration)
+- Implements domain whitelisting and email/domain banning (via PostgreSQL)
 - Handles concurrent connections efficiently with Tokio async runtime (50 concurrent, 2000 queue)
 - Maintains 100-connection PostgreSQL pool with persistent min connections for zero-latency queries
 
@@ -178,8 +178,8 @@ HEARTBEAT_URL=https://your-monitoring-service.com/ping
 | `DATABASE_URL`         | ✅ Yes   | -       | PostgreSQL connection string for storing emails |
 | `SMTP_RECEIVE_PORT`    | ❌ No    | 25      | SMTP port (default: 25)                         |
 | `HEARTBEAT_URL`        | ❌ No    | -       | Uptime monitoring ping URL                      |
-| `USE_SUPABASE_BANS`    | ❌ No    | true    | Enable/disable Supabase ban system              |
-| `USE_SUPABASE_DOMAINS` | ❌ No    | true    | Enable/disable Supabase domain whitelist        |
+| `USE_BANS`             | ❌ No    | true    | Enable/disable PostgreSQL ban system            |
+| `USE_DOMAIN_WHITELIST` | ❌ No    | true    | Enable/disable PostgreSQL domain whitelist      |
 
 ---
 
@@ -200,9 +200,9 @@ This creates:
 - `private_email` table - optional private email accounts (see below)
 - Necessary indexes for performance
 
-### Optional Supabase Tables (for advanced features)
+### Database Tables (for advanced features)
 
-If you want to use domain whitelisting and ban management, create these tables in Supabase:
+If you want to use domain whitelisting and ban management, ensure these tables are present in your PostgreSQL database (Prisma migrations handle this):
 
 #### 1. `domains` table (Domain Whitelist - Optional)
 
@@ -210,7 +210,8 @@ If you want to use domain whitelisting and ban management, create these tables i
 CREATE TABLE domains (
   id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
   domain TEXT NOT NULL UNIQUE,
-  created_at TIMESTAMPTZ DEFAULT NOW()
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  active BOOLEAN DEFAULT true
 );
 
 -- Add your domains
@@ -239,7 +240,7 @@ INSERT INTO bans (scope, value, match_type, status) VALUES
   ('domain', 'spammer.com', 'exact', 'active');
 ```
 
-**Note**: If you don't create these Supabase tables, set `USE_SUPABASE_BANS=false` and `USE_SUPABASE_DOMAINS=false` in your `.env` file. The server will accept all domains and have no bans by default.
+**Note**: If you don't want to use these features, set `USE_BANS=false` and `USE_DOMAIN_WHITELIST=false` in your `.env` file. The server will accept all domains and have no bans by default.
 
 ---
 
@@ -334,7 +335,7 @@ sudo systemctl status cybertemp-smtp
 
 ### Domain Whitelisting
 
-The server **only accepts emails** for domains listed in the configured domain source (Supabase `domains` table if enabled, otherwise accepts all domains). This prevents abuse and unauthorized usage.
+The server **only accepts emails** for domains listed in the configured domain source (PostgreSQL `domains` table if enabled, otherwise accepts all domains). This prevents abuse and unauthorized usage.
 
 **Wildcard support**:
 
@@ -425,14 +426,13 @@ let database_url = env::var("DATABASE_URL")
 - Credentials are correct in `DATABASE_URL`
 - Schema is initialized: `psql -d cybertemp -c "\dt"`
 
-#### 3. "Failed to load domains from Supabase" (if using Supabase features)
+#### 3. "Failed to load domains from PostgreSQL"
 
 **Check**:
 
-- Supabase URL is correct (https://your-project.supabase.co)
-- Service role key is correct (NOT anon key)
-- `domains` table exists in Supabase
-- Network connectivity to Supabase
+- PostgreSQL is running and credentials are correct
+- `domains` table exists in your database schema
+- Network connectivity to PostgreSQL
 
 #### 4. "Permission denied" binding to port 25
 
@@ -474,7 +474,7 @@ RUST_LOG=debug ./target/release/cybertemp_smtp
 | **JavaScript Implementation** | ❌ **Abandoned** | Not maintained, use Rust version      |
 | **PostgreSQL Storage**        | ✅ Production    | Stable and tested                     |
 | **Self-hosted Inboxes**       | ✅ Production    | No external dependencies              |
-| **Supabase Integration**      | ⚠️ Optional      | For advanced features only            |
+| **PostgreSQL Integration**    | ✅ Production    | Complete end-to-end integration       |
 | **Private Email Feature**     | ⚠️ Optional      | Cybertemp-specific, not required      |
 | **Performance**               | ✅ **Optimized** | 20x faster (v0.5.0)                   |
 | **Code Quality**              | ✅ Improved      | Recent refactoring & optimization     |
@@ -507,7 +507,7 @@ v0.3.0 ⋮ 11/01/2025
 + Comprehensive documentation rewrite
 + Clarified private email feature is optional
 + Added extensive troubleshooting guide
-+ Documented Supabase table schemas
++ Documented PostgreSQL table schemas
 + Added systemd service configuration
 
 v0.2.0 ⋮ 09/2024
@@ -520,7 +520,7 @@ v0.2.0 ⋮ 09/2024
 v0.1.0 ⋮ 06/2024
 ! Initial production deployment for Cybertemp
 + PostgreSQL storage implementation
-+ Supabase integration
++ PostgreSQL integration
 + Domain whitelisting
 + Private email support
 + Async Tokio runtime
@@ -546,14 +546,13 @@ MIT License - See LICENSE file for details
 
 - Built with ❤️ for the Cybertemp community
 - Powered by Rust 🦀, Tokio, and PostgreSQL
-- Optional Supabase integration for advanced features
+- Integrated advanced domain and ban management via PostgreSQL
 
 ---
 
 <p align="center">
   <img src="https://img.shields.io/badge/Rust-000000?style=for-the-badge&logo=rust&logoColor=white"/>
   <img src="https://img.shields.io/badge/PostgreSQL-316192?style=for-the-badge&logo=postgresql&logoColor=white"/>
-  <img src="https://img.shields.io/badge/Supabase-181818?style=for-the-badge&logo=supabase&logoColor=white"/>
   <img src="https://img.shields.io/badge/Self--Hosted-Ready-success?style=for-the-badge"/>
 </p>
 

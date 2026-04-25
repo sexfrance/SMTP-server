@@ -12,13 +12,12 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn, error};
 use tracing_subscriber;
 
-// Ban structure returned by Supabase
-#[derive(Debug, Deserialize, Serialize)]
+// Ban structure from PostgreSQL
+#[derive(Debug, sqlx::FromRow)]
 struct Ban {
     scope: String,
     value: String,
-    // Optional: match_type column in DB: 'exact' or 'contains'
-    match_type: Option<String>,
+    match_type: String,
 }
 
 // In-memory ban cache
@@ -54,15 +53,9 @@ struct EmailInsert {
     size: i64,
 }
 
-// Supabase domain structure
-#[derive(Debug, Deserialize)]
+// Domain structure from PostgreSQL
+#[derive(Debug, sqlx::FromRow)]
 struct Domain {
-    domain: String,
-}
-
-// Domain response for polling API
-#[derive(Deserialize)]
-struct DomainResponse {
     domain: String,
 }
 
@@ -85,15 +78,14 @@ async fn main() -> anyhow::Result<()> {
     // Environment variables
     let database_url = env::var("DATABASE_URL")?;
     
-    let supabase_url = env::var("SUPABASE_URL")?;
-    let supabase_key = env::var("SUPABASE_SERVICE_ROLE_KEY")
-        .or_else(|_| env::var("SUPABASE_KEY"))?;
     let heartbeat_url = env::var("HEARTBEAT_URL").ok();
-    let use_supabase_bans: bool = env::var("USE_SUPABASE_BANS")
+    let use_bans: bool = env::var("USE_BANS")
+        .or_else(|_| env::var("USE_SUPABASE_BANS"))
         .unwrap_or_else(|_| "true".to_string())
         .parse()
         .unwrap_or(true);
-    let use_supabase_domains: bool = env::var("USE_SUPABASE_DOMAINS")
+    let use_domains: bool = env::var("USE_DOMAIN_WHITELIST")
+        .or_else(|_| env::var("USE_SUPABASE_DOMAINS"))
         .unwrap_or_else(|_| "true".to_string())
         .parse()
         .unwrap_or(true);
@@ -175,41 +167,39 @@ async fn main() -> anyhow::Result<()> {
     
     let batch_sender = Arc::new(batch_tx);
     
-    // Initialize domain whitelist from Supabase (if enabled)
-    if use_supabase_domains {
-        if let Err(e) = load_domain_whitelist(&supabase_url, &supabase_key, domain_whitelist.clone()).await {
+    // Initialize domain whitelist from PostgreSQL (if enabled)
+    if use_domains {
+        if let Err(e) = load_domain_whitelist(&postgres_pool, domain_whitelist.clone()).await {
             warn!("✗ Failed to load domain whitelist: {}", e);
         }
     } else {
-        info!("✓ Supabase domains disabled - accepting all domains");
+        info!("✓ Domain whitelist disabled - accepting all domains");
     }
 
-    // Initialize bans from Supabase (if enabled)
-    if use_supabase_bans {
+    // Initialize bans from PostgreSQL (if enabled)
+    if use_bans {
         // Perform an initial synchronous load of bans (same pattern as domains)
         // so bans are populated before the listener starts, mirroring domain behavior.
-        load_bans(&supabase_url, &supabase_key, bans_cache.clone()).await;
+        load_bans(&postgres_pool, bans_cache.clone()).await;
     } else {
-        info!("✓ Supabase bans disabled - no external bans loaded");
+        info!("✓ Bans disabled - no external bans loaded");
     }
 
     // Start domain updates polling (if enabled)
-    if use_supabase_domains {
+    if use_domains {
         let whitelist_clone = domain_whitelist.clone();
-        let supabase_url_clone = supabase_url.clone();
-        let supabase_key_clone = supabase_key.clone();
+        let pool_clone = postgres_pool.clone();
         tokio::spawn(async move {
-            poll_domain_updates(supabase_url_clone, supabase_key_clone, whitelist_clone).await;
+            poll_domain_updates(pool_clone, whitelist_clone).await;
         });
     }
 
     // Start bans polling (if enabled)
-    if use_supabase_bans {
+    if use_bans {
         let bans_cache_clone = bans_cache.clone();
-        let supabase_url_clone2 = supabase_url.clone();
-        let supabase_key_clone2 = supabase_key.clone();
+        let pool_clone = postgres_pool.clone();
         tokio::spawn(async move {
-            poll_bans(supabase_url_clone2, supabase_key_clone2, bans_cache_clone).await;
+            poll_bans(pool_clone, bans_cache_clone).await;
         });
     }
 
@@ -724,175 +714,121 @@ fn is_domain_allowed(domain: &str, whitelist: &HashSet<String>) -> bool {
 }
 
 async fn load_domain_whitelist(
-    supabase_url: &str,
-    supabase_key: &str,
+    pool: &PgPool,
     whitelist: Arc<Mutex<HashSet<String>>>,
 ) -> anyhow::Result<()> {
-    let client = Client::new();
-    let api_url = format!("{}/rest/v1/domains", supabase_url);
-    match client
-        .get(&api_url)
-        .header("apikey", supabase_key)
-        .header("Authorization", format!("Bearer {}", supabase_key))
-        .send()
-        .await {
-            Ok(response) => {
-                match response.json::<Vec<Domain>>().await {
-                    Ok(res) => {
-                        let mut wl = whitelist.lock().await;
-                        for domain in res {
-                            let domain_lower = domain.domain.to_lowercase();
-                            wl.insert(domain_lower.clone());
-                            if !domain_lower.starts_with("*.") {
-                                wl.insert(format!("*.{}", domain_lower));
-                            }
-                        }
-                        info!("✅ Loaded {} whitelisted domains from Supabase", wl.len() / 2);
-                        if wl.is_empty() {
-                            warn!("⚠ No domains configured - all emails will be accepted");
-                        }
-                        Ok(())
-                    }
-                    Err(e) => {
-                        warn!("⚠ Failed to parse Supabase domains response: {}", e);
-                        Err(anyhow::anyhow!("Supabase parse error: {}", e))
-                    }
+    match sqlx::query_as::<_, Domain>("SELECT domain FROM domains WHERE active = true")
+        .fetch_all(pool)
+        .await
+    {
+        Ok(res) => {
+            let mut wl = whitelist.lock().await;
+            for domain in res {
+                let domain_lower = domain.domain.to_lowercase();
+                wl.insert(domain_lower.clone());
+                if !domain_lower.starts_with("*.") {
+                    wl.insert(format!("*.{}", domain_lower));
                 }
             }
-            Err(e) => {
-                warn!("⚠ Failed to load domains from Supabase: {}", e);
-                warn!("📧 SMTP server will accept all domains until connection is restored");
-                Err(anyhow::anyhow!("Supabase connection error: {}", e))
+            info!("✅ Loaded {} whitelisted domains from PostgreSQL", wl.len() / 2);
+            if wl.is_empty() {
+                warn!("⚠ No domains configured - all emails will be accepted");
             }
+            Ok(())
         }
+        Err(e) => {
+            warn!("⚠ Failed to load domains from PostgreSQL: {}", e);
+            warn!("📧 SMTP server will accept all domains until connection is restored");
+            Err(anyhow::anyhow!("Database connection error: {}", e))
+        }
+    }
 }
 
 async fn poll_domain_updates(
-    supabase_url: String,
-    supabase_key: String,
+    pool: PgPool,
     whitelist: Arc<Mutex<HashSet<String>>>,
 ) {
-    let client = Client::new();
     // Reduced from 60s to 120s for 1 vCore optimization
     let mut poll_interval = tokio::time::interval(Duration::from_secs(120));
     
     loop {
         poll_interval.tick().await;
         
-        info!("🔄 Polling Supabase for domain updates...");
+        info!("🔄 Polling PostgreSQL for domain updates...");
         
-        let url = format!("{}/rest/v1/domains?select=domain", supabase_url);
-        
-        match client
-            .get(&url)
-            .header("apikey", &supabase_key)
-            .header("Authorization", format!("Bearer {}", supabase_key))
-            .send()
+        match sqlx::query_as::<_, Domain>("SELECT domain FROM domains WHERE active = true")
+            .fetch_all(&pool)
             .await
         {
-            Ok(response) => {
-                if response.status().is_success() {
-                    match response.json::<Vec<DomainResponse>>().await {
-                        Ok(domains) => {
-                            let mut wl = whitelist.lock().await;
-                            wl.clear();
-                            
-                            for domain_response in domains {
-                                let domain_lower = domain_response.domain.to_lowercase();
-                                wl.insert(domain_lower.clone());
-                                if !domain_lower.starts_with("*.") {
-                                    wl.insert(format!("*.{}", domain_lower));
-                                }
-                            }
-                            
-                            info!("✅ Updated {} domains from Supabase", wl.len() / 2);
-                        }
-                        Err(e) => {
-                            warn!("⚠ Failed to parse domains response: {}", e);
-                        }
+            Ok(domains) => {
+                let mut wl = whitelist.lock().await;
+                wl.clear();
+                
+                for domain_row in domains {
+                    let domain_lower = domain_row.domain.to_lowercase();
+                    wl.insert(domain_lower.clone());
+                    if !domain_lower.starts_with("*.") {
+                        wl.insert(format!("*.{}", domain_lower));
                     }
-                } else {
-                    warn!("⚠ Failed to fetch domains: HTTP {}", response.status());
                 }
+                
+                info!("✅ Updated {} domains from PostgreSQL", wl.len() / 2);
             }
             Err(e) => {
-                warn!("⚠ Failed to connect to Supabase for domain polling: {}", e);
+                warn!("⚠ Failed to connect to PostgreSQL for domain polling: {}", e);
             }
         }
     }
 }
 
-async fn load_bans(supabase_url: &str, supabase_key: &str, bans_cache: Arc<RwLock<BansCache>>) {
-    let client = Client::new();
-    let url = format!("{}/rest/v1/bans?status=eq.active", supabase_url);
-
-    match client
-        .get(&url)
-        .header("apikey", supabase_key)
-        .header("Authorization", format!("Bearer {}", supabase_key))
-        .send()
+async fn load_bans(pool: &PgPool, bans_cache: Arc<RwLock<BansCache>>) {
+    match sqlx::query_as::<_, Ban>("SELECT scope, value, match_type FROM bans WHERE status = 'active'")
+        .fetch_all(pool)
         .await
     {
-        Ok(resp) => {
-            let status = resp.status();
-            if status.is_success() {
-                match resp.json::<Vec<Ban>>().await {
-                    Ok(rows) => {
-                        let mut cache = BansCache::default();
-                        for b in rows {
-                            let scope = b.scope.to_lowercase();
-                            let mut val = b.value.trim().to_lowercase();
-                            let mtype = b.match_type.unwrap_or_else(|| "exact".to_string()).to_lowercase();
-                            match scope.as_str() {
-                                "email" => {
-                                    if mtype == "contains" {
-                                        if val.starts_with("contains:") {
-                                            val = val["contains:".len()..].to_string();
-                                        }
-                                        cache.email_contains.push(val.clone());
-                                    } else {
-                                        cache.email_exact.insert(val.clone());
-                                    }
-                                }
-                                "domain" => {
-                                    cache.domain.insert(val.clone());
-                                }
-                                _ => {}
+        Ok(rows) => {
+            let mut cache = BansCache::default();
+            for b in rows {
+                let scope = b.scope.to_lowercase();
+                let mut val = b.value.trim().to_lowercase();
+                let mtype = b.match_type.to_lowercase();
+                match scope.as_str() {
+                    "email" => {
+                        if mtype == "contains" {
+                            if val.starts_with("contains:") {
+                                val = val["contains:".len()..].to_string();
                             }
+                            cache.email_contains.push(val.clone());
+                        } else {
+                            cache.email_exact.insert(val.clone());
                         }
-                        // Swap caches atomically
-                        let mut guard = bans_cache.write().await;
-                        *guard = cache;
-                        info!("✅ Loaded bans (global_exact={}, global_contains={}, global_domains={})", guard.email_exact.len(), guard.email_contains.len(), guard.domain.len());
                     }
-                    Err(e) => {
-                        warn!("⚠ Failed to parse bans JSON: {}", e);
+                    "domain" => {
+                        cache.domain.insert(val.clone());
                     }
-                }
-            } else {
-                // read response body for diagnostics (avoid logging secrets)
-                match resp.text().await {
-                    Ok(body) => warn!("⚠ Bans fetch HTTP {}. Body: {}", status, body),
-                    Err(e) => warn!("⚠ Bans fetch HTTP {} and failed to read body: {}", status, e),
+                    _ => {}
                 }
             }
+            // Swap caches atomically
+            let mut guard = bans_cache.write().await;
+            *guard = cache;
+            info!("✅ Loaded bans (global_exact={}, global_contains={}, global_domains={})", guard.email_exact.len(), guard.email_contains.len(), guard.domain.len());
         }
         Err(e) => {
-            warn!("⚠ Failed to connect to Supabase for bans polling: {:?}", e);
-            warn!("   reqwest::Error::is_timeout() = {} | status = {:?}", e.is_timeout(), e.status());
+            warn!("⚠ Failed to connect to PostgreSQL for bans polling: {:?}", e);
         }
     }
 }
 
-async fn poll_bans(supabase_url: String, supabase_key: String, bans_cache: Arc<RwLock<BansCache>>) {
+async fn poll_bans(pool: PgPool, bans_cache: Arc<RwLock<BansCache>>) {
     // Reduced from 30s to 60s for 1 vCore optimization
     let mut poll_interval = tokio::time::interval(Duration::from_secs(60));
     // Initial load
-    load_bans(&supabase_url, &supabase_key, bans_cache.clone()).await;
+    load_bans(&pool, bans_cache.clone()).await;
     loop {
         poll_interval.tick().await;
-        info!("🔄 Polling Supabase for bans updates...");
-        load_bans(&supabase_url, &supabase_key, bans_cache.clone()).await;
+        info!("🔄 Polling PostgreSQL for bans updates...");
+        load_bans(&pool, bans_cache.clone()).await;
     }
 }
 

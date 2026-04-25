@@ -1,0 +1,32 @@
+    Checking lettre v0.11.19
+error: feature `rustls` also requires either the `aws-lc-rs` or the `ring` feature to
+           be enabled
+   --> C:\Users\User\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\lettre-0.11.19\src\lib.rs:208:5
+    |
+208 | /     compile_error!(
+209 | |         "feature `rustls` also requires either the `aws-lc-rs` or the `ring` feature to
+210 | |     be enabled"
+211 | |     );
+    | |_____^
+
+error: feature `rustls` also requires either the `rustls-platform-verifier`, the `rustls-native-certs`
+           or the `webpki-roots` feature to be enabled
+   --> C:\Users\User\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\lettre-0.11.19\src\lib.rs:219:5
+    |
+219 | /     compile_error!(
+220 | |         "feature `rustls` also requires either the `rustls-platform-verifier`, the `rustls-native-certs`
+221 | |     or the `webpki-roots` feature to be enabled"
+222 | |     );
+    | |_____^
+
+error: Lettre is being built with the `tokio1` and the `native-tls` features, but the `tokio1-native-tls` feature hasn't been turned on.
+           If you were trying to opt into `rustls` and did not activate `native-tls`, disable the default-features of lettre in `Cargo.toml` and manually add the required features.
+           Make sure to apply the same to any of your crate dependencies that use the `lettre` crate.
+   --> C:\Users\User\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\lettre-0.11.19\src\lib.rs:233:5
+    |
+233 | /     compile_error!("Lettre is being built with the `tokio1` and the `native-tls` features, but the `tokio1-native-tls` feature hasn't bee...
+234 | |     If you were trying to opt into `rustls` and did not activate `native-tls`, disable the default-features of lettre in `Cargo.toml` and...
+235 | |     Make sure to apply the same to any of your crate dependencies that use the `lettre` crate.");
+    | |________________________________________________________________________________________________^
+
+error: could not compile `lettre` (lib) due to 3 previous errors
