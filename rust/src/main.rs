@@ -756,7 +756,7 @@ async fn poll_domain_updates(
         
         info!("🔄 Polling PostgreSQL for domain updates...");
         
-        match sqlx::query_as::<_, Domain>("SELECT domain FROM domains WHERE active = true")
+        match sqlx::query_as::<_, Domain>("SELECT domain FROM domains")
             .fetch_all(&pool)
             .await
         {
