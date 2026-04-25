@@ -717,7 +717,7 @@ async fn load_domain_whitelist(
     pool: &PgPool,
     whitelist: Arc<Mutex<HashSet<String>>>,
 ) -> anyhow::Result<()> {
-    match sqlx::query_as::<_, Domain>("SELECT domain FROM domains WHERE active = true")
+    match sqlx::query_as::<_, Domain>("SELECT domain FROM domains;")
         .fetch_all(pool)
         .await
     {
