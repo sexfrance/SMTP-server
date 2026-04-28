@@ -4,13 +4,14 @@ use tokio::{
     sync::{Semaphore, Mutex, RwLock, mpsc},
     time::Duration,
 };
-use std::{collections::{HashSet}, env, sync::{Arc, atomic::{AtomicUsize, Ordering}}};
+use std::{collections::{HashSet}, env, panic::AssertUnwindSafe, sync::{Arc, atomic::{AtomicUsize, Ordering}}};
 use mailparse::{parse_mail, MailHeaderMap};
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn, error};
 use tracing_subscriber;
+use futures::FutureExt;
 
 // Ban structure from PostgreSQL
 #[derive(Debug, sqlx::FromRow)]
@@ -104,23 +105,25 @@ async fn main() -> anyhow::Result<()> {
 
     // SurrealDB removed - using PostgreSQL for private emails
 
-    // Domain whitelist
-    let domain_whitelist: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    // Domain whitelist (RwLock so RCPT TO and process_email don't serialize on a Mutex)
+    let domain_whitelist: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
     // No per-receiver scoping: this instance ignores receiver-specific bans
 
     // Bans cache (email exact, contains, domain)
     let bans_cache: Arc<RwLock<BansCache>> = Arc::new(RwLock::new(BansCache::default()));
     
-    // Create batch insert channel for database efficiency (increased buffer)
-    let (batch_tx, mut batch_rx) = mpsc::channel::<EmailInsert>(15000);
+    // Create batch insert channel. Bounded so a burst caps memory at
+    // ~2000 × avg-email-size instead of 15000 × …
+    let (batch_tx, mut batch_rx) = mpsc::channel::<EmailInsert>(2000);
     
     // Spawn batch insert worker
     let postgres_pool_batch = postgres_pool.clone();
     let batch_handle = tokio::spawn(async move {
         // Increased buffer capacity to hold more emails before flushing
         let mut buffer: Vec<EmailInsert> = Vec::with_capacity(1000);
-        // Decreased flush interval to 50ms for near-instant latency
-        let mut flush_interval = tokio::time::interval(Duration::from_millis(50));
+        // 200ms gives idle traffic up to 200ms to coalesce into a real batch,
+        // while staying well under typical SMTP RTT so end-to-end latency is unchanged.
+        let mut flush_interval = tokio::time::interval(Duration::from_millis(200));
         flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         
         loop {
@@ -225,9 +228,11 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Concurrency control
-    let semaphore = Arc::new(Semaphore::new(250));
-    let max_queue = 15000;
+    // Concurrency control. With 2 vCores we can really only process ~10-20
+    // SMTP sessions in parallel; 64 leaves headroom for short bursts without
+    // letting an attacker pile up thousands of in-flight tasks.
+    let semaphore = Arc::new(Semaphore::new(64));
+    let max_queue = 2000;
     let queue_counter = Arc::new(Mutex::new(0usize));
 
     // Start TCP listener for SMTP
@@ -281,7 +286,7 @@ async fn main() -> anyhow::Result<()> {
 async fn handle_smtp(
     socket: tokio::net::TcpStream,
     postgres_pool: PgPool,
-    whitelist: Arc<Mutex<HashSet<String>>>,
+    whitelist: Arc<RwLock<HashSet<String>>>,
     bans_cache: Arc<RwLock<BansCache>>,
     batch_sender: Arc<mpsc::Sender<EmailInsert>>,
     instance: Arc<String>,
@@ -290,26 +295,29 @@ async fn handle_smtp(
     socket.set_nodelay(true)?;
     let (reader, mut writer) = socket.into_split();
     let mut reader = BufReader::new(reader);
-    let mut line = String::new();
+    let mut buf: Vec<u8> = Vec::with_capacity(1024);
 
     writer.write_all(b"220 Cybertemp Mail Receiver\r\n").await?;
 
     let mut mail_from = String::new();
     let mut rcpt_to = String::new();
     let mut data_mode = false;
-    let mut email_data = Vec::new();
+    // Email body bytes accumulated verbatim, including binary content.
+    let mut email_data: Vec<u8> = Vec::with_capacity(8192);
 
     loop {
-        line.clear();
-        let bytes = reader.read_line(&mut line).await?;
+        buf.clear();
+        let bytes = reader.read_until(b'\n', &mut buf).await?;
         if bytes == 0 { break; }
-        let cmd = line.trim_end();
 
         if data_mode {
-            if cmd == "." {
+            // Strip trailing CRLF/LF for the "." terminator check, but preserve full bytes for the body.
+            let trimmed_len = trim_trailing_crlf_len(&buf);
+            if trimmed_len == 1 && buf[0] == b'.' {
                 data_mode = false;
                 info!("[SMTP IN] DATA stream completed [inst: {}]", instance.as_str());
-                let email_data_clone = email_data.clone();
+
+                let email_bytes = std::mem::take(&mut email_data);
                 let rcpt_to_clone = rcpt_to.clone();
                 let mail_from_clone = mail_from.clone();
                 let postgres_pool_clone = postgres_pool.clone();
@@ -317,10 +325,14 @@ async fn handle_smtp(
                 let bans_cache_clone = bans_cache.clone();
                 let batch_sender_clone = batch_sender.clone();
                 let instance_clone = instance.clone();
+                let instance_for_panic = instance.clone();
+                let from_for_panic = mail_from.clone();
+                let to_for_panic = rcpt_to.clone();
 
+                // Catch panics so a single malformed email never silently drops.
                 tokio::spawn(async move {
-                    if let Err(e) = process_email(
-                        &email_data_clone,
+                    let fut = AssertUnwindSafe(process_email(
+                        email_bytes,
                         &rcpt_to_clone,
                         &mail_from_clone,
                         &postgres_pool_clone,
@@ -328,19 +340,31 @@ async fn handle_smtp(
                         &bans_cache_clone,
                         &batch_sender_clone,
                         instance_clone,
-                    ).await {
-                        error!("Failed to process email: {}", e);
+                    ));
+                    match fut.catch_unwind().await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => error!("Failed to process email: {} [inst: {}]", e, instance_for_panic.as_str()),
+                        Err(_) => error!(
+                            "🔥 process_email PANICKED for {} -> {} [inst: {}] — email lost",
+                            from_for_panic, to_for_panic, instance_for_panic.as_str()
+                        ),
                     }
                 });
 
                 writer.write_all(b"250 Ok: Message accepted\r\n").await?;
                 info!("✓ Email accepted for processing [inst: {}]", instance.as_str());
-                email_data.clear();
             } else {
-                email_data.push(cmd.to_string());
+                // SMTP transparency: a leading '.' on a body line is doubled by the sender.
+                // Strip one leading '.' if present (RFC 5321 §4.5.2).
+                let body_slice = if buf.first() == Some(&b'.') { &buf[1..] } else { &buf[..] };
+                email_data.extend_from_slice(body_slice);
             }
             continue;
         }
+
+        // Commands are ASCII — lossy decode is safe and avoids dropping connections on stray bytes.
+        let line_str = String::from_utf8_lossy(&buf);
+        let cmd = line_str.trim_end();
 
         if cmd.starts_with("HELO") || cmd.starts_with("EHLO") {
             let hostname = cmd.split_whitespace().nth(1).unwrap_or("unknown");
@@ -355,7 +379,7 @@ async fn handle_smtp(
             let email = extract_email(&rcpt_to);
             let domain = email.split('@').nth(1).unwrap_or("").to_lowercase();
             
-            let whitelist_guard = whitelist.lock().await;
+            let whitelist_guard = whitelist.read().await;
             let domain_allowed = if whitelist_guard.is_empty() {
                 warn!("[Domains] No domains loaded - allowing all domains");
                 true
@@ -405,6 +429,14 @@ async fn handle_smtp(
     Ok(())
 }
 
+fn trim_trailing_crlf_len(buf: &[u8]) -> usize {
+    let mut end = buf.len();
+    while end > 0 && (buf[end - 1] == b'\n' || buf[end - 1] == b'\r') {
+        end -= 1;
+    }
+    end
+}
+
 fn extract_email(addr: &str) -> String {
     if addr.starts_with('<') && addr.ends_with('>') {
         addr[1..addr.len()-1].to_string()
@@ -420,26 +452,25 @@ fn sanitize_for_postgres(s: &str) -> String {
 
 // Process email content - FIXED VERSION
 async fn process_email(
-    data: &Vec<String>,
+    data: Vec<u8>,
     rcpt_to: &str,
     mail_from: &str,
     postgres_pool: &PgPool,
-    whitelist: &Arc<Mutex<HashSet<String>>>,
+    whitelist: &Arc<RwLock<HashSet<String>>>,
     bans_cache: &Arc<RwLock<BansCache>>,
     batch_sender: &Arc<mpsc::Sender<EmailInsert>>,
     instance: Arc<String>,
 ) -> anyhow::Result<()> {
-    // Join all email data lines with CRLF (SMTP standard)
-    let raw_email = data.join("\r\n");
-    let raw_size = raw_email.len() as i64;
-    
-    info!("📧 Processing email - Raw size: {} bytes [inst: {}]", raw_email.len(), instance.as_str());
+    // Bytes already include line terminators preserved verbatim from the wire.
+    let raw_size = data.len() as i64;
+
+    info!("📧 Processing email - Raw size: {} bytes [inst: {}]", data.len(), instance.as_str());
 
     let recipient_email = extract_email(rcpt_to).to_lowercase();
     let from_address = extract_email(mail_from).to_lowercase();
 
     let domain = recipient_email.split('@').nth(1).unwrap_or("").to_lowercase();
-    let whitelist_guard = whitelist.lock().await;
+    let whitelist_guard = whitelist.read().await;
     let domain_allowed = if whitelist_guard.is_empty() {
         true
     } else {
@@ -468,7 +499,7 @@ async fn process_email(
     // Parse email ONCE - extract subject, text body, and html body in a single pass
     // Uses recursive MIME traversal so deeply nested parts (e.g.
     // multipart/mixed → multipart/related → multipart/alternative → text/html) are found.
-    let (subject, text_body, html_body) = match parse_mail(raw_email.as_bytes()) {
+    let (subject, text_body, html_body) = match parse_mail(&data) {
         Ok(parsed) => {
             let subject = parsed.get_headers().get_first_value("Subject")
                 .unwrap_or_else(|| "No Subject".to_string());
@@ -534,16 +565,17 @@ async fn process_email(
             }
 
             if text_body.trim().is_empty() && html_body.trim().is_empty() {
-                let body_only = strip_email_headers(&raw_email);
-                text_body = body_only;
+                let raw_lossy = String::from_utf8_lossy(&data);
+                text_body = strip_email_headers(&raw_lossy);
             }
 
             (subject, text_body, html_body)
         }
         Err(e) => {
             warn!("mailparse failed: {} - using fallback [inst: {}]", e, instance.as_str());
-            let subject = extract_subject_from_raw(&raw_email).unwrap_or_else(|| "No Subject".to_string());
-            (subject, raw_email.clone(), String::new())
+            let raw_lossy = String::from_utf8_lossy(&data).into_owned();
+            let subject = extract_subject_from_raw(&raw_lossy).unwrap_or_else(|| "No Subject".to_string());
+            (subject, raw_lossy, String::new())
         }
     };
 
@@ -715,14 +747,14 @@ fn is_domain_allowed(domain: &str, whitelist: &HashSet<String>) -> bool {
 
 async fn load_domain_whitelist(
     pool: &PgPool,
-    whitelist: Arc<Mutex<HashSet<String>>>,
+    whitelist: Arc<RwLock<HashSet<String>>>,
 ) -> anyhow::Result<()> {
     match sqlx::query_as::<_, Domain>("SELECT domain FROM domains;")
         .fetch_all(pool)
         .await
     {
         Ok(res) => {
-            let mut wl = whitelist.lock().await;
+            let mut wl = whitelist.write().await;
             for domain in res {
                 let domain_lower = domain.domain.to_lowercase();
                 wl.insert(domain_lower.clone());
@@ -746,22 +778,22 @@ async fn load_domain_whitelist(
 
 async fn poll_domain_updates(
     pool: PgPool,
-    whitelist: Arc<Mutex<HashSet<String>>>,
+    whitelist: Arc<RwLock<HashSet<String>>>,
 ) {
     // Reduced from 60s to 120s for 1 vCore optimization
     let mut poll_interval = tokio::time::interval(Duration::from_secs(120));
-    
+
     loop {
         poll_interval.tick().await;
-        
+
         info!("🔄 Polling PostgreSQL for domain updates...");
-        
+
         match sqlx::query_as::<_, Domain>("SELECT domain FROM domains")
             .fetch_all(&pool)
             .await
         {
             Ok(domains) => {
-                let mut wl = whitelist.lock().await;
+                let mut wl = whitelist.write().await;
                 wl.clear();
                 
                 for domain_row in domains {
