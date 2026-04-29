@@ -91,11 +91,14 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .unwrap_or(true);
     let listen_port: u16 = env::var("SMTP_RECEIVE_PORT").unwrap_or("25".into()).parse()?;
+    let smtp_max_sessions: usize = env::var("SMTP_MAX_SESSIONS").unwrap_or("200".into()).parse().unwrap_or(200);
+    let smtp_max_queue: usize = env::var("SMTP_MAX_QUEUE").unwrap_or("5000".into()).parse().unwrap_or(5000);
+    let smtp_session_timeout_secs: u64 = env::var("SMTP_SESSION_TIMEOUT_SECS").unwrap_or("120".into()).parse().unwrap_or(120);
 
     // Create PostgreSQL connection pool for temporary emails
     let postgres_pool = PgPoolOptions::new()
-        .max_connections(40)
-        .min_connections(10)
+        .max_connections(80)
+        .min_connections(20)
         .acquire_timeout(Duration::from_secs(5))
         .idle_timeout(Duration::from_secs(300))
         .max_lifetime(Duration::from_secs(1800))
@@ -228,11 +231,12 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Concurrency control. With 2 vCores we can really only process ~10-20
-    // SMTP sessions in parallel; 64 leaves headroom for short bursts without
-    // letting an attacker pile up thousands of in-flight tasks.
-    let semaphore = Arc::new(Semaphore::new(64));
-    let max_queue = 2000;
+    // Concurrency control — tuned for 6 vCores / 24 GB RAM.
+    // SMTP_MAX_SESSIONS caps simultaneous sessions; SMTP_MAX_QUEUE caps total
+    // connections in flight waiting for a semaphore slot.
+    info!("Concurrency: max_sessions={} max_queue={} session_timeout={}s", smtp_max_sessions, smtp_max_queue, smtp_session_timeout_secs);
+    let semaphore = Arc::new(Semaphore::new(smtp_max_sessions));
+    let max_queue = smtp_max_queue;
     let queue_counter = Arc::new(Mutex::new(0usize));
 
     // Start TCP listener for SMTP
@@ -250,26 +254,44 @@ async fn main() -> anyhow::Result<()> {
         let connection_counter = connection_counter.clone();
         let batch_sender = batch_sender.clone();
 
+        let session_timeout = Duration::from_secs(smtp_session_timeout_secs);
         tokio::spawn(async move {
             let _permit = semaphore.acquire().await.unwrap();
-            
+
             // Assign connection slot (1-50)
             let conn_slot = (connection_counter.fetch_add(1, Ordering::Relaxed) % 50) + 1;
             let instance = Arc::new(format!("slot:{}", conn_slot));
-            
-            let queue_size = {
+
+            // Check queue limit; respond with 421 (transient) so senders retry instead of
+            // silently dropping the TCP connection (which some MTAs treat as permanent).
+            let queue_result = {
                 let mut q = queue_counter.lock().await;
                 if *q >= max_queue {
-                    warn!("Server busy, rejecting connection {} [Queue: {}/{}] [inst: {}]", addr, *q, max_queue, instance.as_str());
+                    None
+                } else {
+                    *q += 1;
+                    Some(*q)
+                }
+            };
+            let queue_size = match queue_result {
+                Some(n) => n,
+                None => {
+                    warn!("Server busy, rejecting connection {} [Queue: full/{}] [inst: {}]", addr, max_queue, instance.as_str());
+                    let (_, mut w) = socket.into_split();
+                    let _ = w.write_all(b"421 Service temporarily unavailable - try again later\r\n").await;
                     return;
                 }
-                *q += 1;
-                *q
             };
 
             info!("[SMTP IN] New connection from {} -> local [Queue: {}/{}] [inst: {}]", addr, queue_size, max_queue, instance.as_str());
-            if let Err(e) = handle_smtp(socket, postgres_pool, whitelist, bans_cache, batch_sender, instance.clone()).await {
-                error!("Error handling {}: {:?}", addr, e);
+            let result = tokio::time::timeout(
+                session_timeout,
+                handle_smtp(socket, postgres_pool, whitelist, bans_cache, batch_sender, instance.clone()),
+            ).await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => error!("Error handling {}: {:?}", addr, e),
+                Err(_) => warn!("SMTP session timeout for {} [inst: {}]", addr, instance.as_str()),
             }
 
             let queue_size = {
@@ -366,10 +388,14 @@ async fn handle_smtp(
         let line_str = String::from_utf8_lossy(&buf);
         let cmd = line_str.trim_end();
 
-        if cmd.starts_with("HELO") || cmd.starts_with("EHLO") {
+        if cmd.starts_with("HELO") {
             let hostname = cmd.split_whitespace().nth(1).unwrap_or("unknown");
-            info!("[SMTP IN] {} from {} [inst: {}]", cmd.split_whitespace().next().unwrap_or("HELO"), hostname, instance.as_str());
+            info!("[SMTP IN] HELO from {} [inst: {}]", hostname, instance.as_str());
             writer.write_all(b"250 Hello\r\n").await?;
+        } else if cmd.starts_with("EHLO") {
+            let hostname = cmd.split_whitespace().nth(1).unwrap_or("unknown");
+            info!("[SMTP IN] EHLO from {} [inst: {}]", hostname, instance.as_str());
+            writer.write_all(b"250-Hello\r\n250-SIZE 52428800\r\n250-8BITMIME\r\n250 ENHANCEDSTATUSCODES\r\n").await?;
         } else if cmd.starts_with("MAIL FROM:") {
             mail_from = cmd[10..].trim().to_string();
             info!("[SMTP IN] MAIL FROM: {} [inst: {}]", mail_from, instance.as_str());
@@ -780,8 +806,7 @@ async fn poll_domain_updates(
     pool: PgPool,
     whitelist: Arc<RwLock<HashSet<String>>>,
 ) {
-    // Reduced from 60s to 120s for 1 vCore optimization
-    let mut poll_interval = tokio::time::interval(Duration::from_secs(120));
+    let mut poll_interval = tokio::time::interval(Duration::from_secs(60));
 
     loop {
         poll_interval.tick().await;
@@ -954,8 +979,8 @@ async fn flush_batch(pool: &PgPool, buffer: &mut Vec<EmailInsert>) {
                     buffer.clear();
                 }
                 Err(e) => {
-                    error!("Failed to commit batch transaction: {} - emails may need manual check", e);
-                    buffer.clear();
+                    // Do NOT clear buffer — keep emails for retry on the next flush tick.
+                    error!("Failed to commit batch transaction: {} - {} emails kept for retry", e, batch_len);
                 }
             }
         }
