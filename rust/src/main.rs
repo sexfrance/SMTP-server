@@ -475,7 +475,7 @@ async fn async_main(worker_threads: usize) -> anyhow::Result<()> {
             }
 
             let queue_size = queue_counter.fetch_sub(1, Ordering::AcqRel).saturating_sub(1);
-            debug!("[SMTP OUT] Connection closed from {} [Queue: {}/{}] [inst: {}]",
+            info!("[SMTP OUT] Connection closed from {} [Queue: {}/{}] [inst: {}]",
                   addr, queue_size, max_queue, instance.as_str());
         });
 
