@@ -11,7 +11,7 @@ use std::{
 };
 use mailparse::{parse_mail, MailHeaderMap};
 use sqlx::postgres::{PgPool, PgPoolOptions};
-use tracing::{info, warn, error};
+use tracing::{info, warn, error, debug};
 use arc_swap::ArcSwap;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -20,7 +20,7 @@ use arc_swap::ArcSwap;
 const MAX_EMAIL_SIZE_BYTES: usize = 50 * 1024 * 1024; // 50 MB hard cap
 const BATCH_CHANNEL_SIZE: usize = 5000;                // was 2000
 const BATCH_FLUSH_SIZE: usize = 1000;                   // flush when buffer reaches this
-const BATCH_FLUSH_INTERVAL_MS: u64 = 50;                // flush every 50ms minimum
+const BATCH_FLUSH_INTERVAL_MS: u64 = 100;               // flush every 100ms minimum
 const BATCH_FLUSH_TIMEOUT_SECS: u64 = 30;              // hard timeout per flush
 const DOMAIN_POLL_INTERVAL_SECS: u64 = 60;
 const BANS_POLL_INTERVAL_SECS: u64 = 60;
@@ -144,7 +144,11 @@ async fn async_main(worker_threads: usize) -> anyhow::Result<()> {
 
     let connection_counter = Arc::new(AtomicUsize::new(0));
 
+    // RUST_LOG controls verbosity. Default is INFO; set RUST_LOG=debug to see
+    // per-SMTP-command tracing.
+    let log_filter = env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
     tracing_subscriber::fmt()
+        .with_env_filter(log_filter)
         .with_target(false)
         .with_thread_ids(false)
         .with_file(false)
@@ -446,7 +450,7 @@ async fn async_main(worker_threads: usize) -> anyhow::Result<()> {
                 return;
             }
 
-            info!("[SMTP IN] New connection from {} -> local [Queue: {}/{}] [inst: {}]",
+            debug!("[SMTP IN] New connection from {} -> local [Queue: {}/{}] [inst: {}]",
                   addr, reserved, max_queue, instance.as_str());
 
             let result = tokio::time::timeout(
@@ -471,7 +475,7 @@ async fn async_main(worker_threads: usize) -> anyhow::Result<()> {
             }
 
             let queue_size = queue_counter.fetch_sub(1, Ordering::AcqRel).saturating_sub(1);
-            info!("[SMTP OUT] Connection closed from {} [Queue: {}/{}] [inst: {}]",
+            debug!("[SMTP OUT] Connection closed from {} [Queue: {}/{}] [inst: {}]",
                   addr, queue_size, max_queue, instance.as_str());
         });
 
@@ -621,7 +625,7 @@ async fn handle_smtp(
             let trimmed_len = trim_trailing_crlf_len(&buf);
             if trimmed_len == 1 && buf[0] == b'.' {
                 data_mode = false;
-                info!("[SMTP IN] DATA stream completed [inst: {}]", instance.as_str());
+                debug!("[SMTP IN] DATA stream completed [inst: {}]", instance.as_str());
 
                 // FIX #1: Check email size BEFORE processing
                 if email_data.len() > MAX_EMAIL_SIZE_BYTES {
@@ -658,7 +662,7 @@ async fn handle_smtp(
                 match process_result {
                     Ok(ProcessResult::Accepted) => {
                         writer.write_all(b"250 Ok: Message accepted\r\n").await?;
-                        info!("✓ Email accepted for processing [inst: {}]", instance.as_str());
+                        debug!("✓ Email accepted for processing [inst: {}]", instance.as_str());
                     }
                     Ok(ProcessResult::Rejected(reason)) => {
                         writer.write_all(format!("550 {}\r\n", reason).as_bytes()).await?;
@@ -696,17 +700,17 @@ async fn handle_smtp(
 
         if cmd.starts_with("HELO") {
             let hostname = cmd.split_whitespace().nth(1).unwrap_or("unknown");
-            info!("[SMTP IN] HELO from {} [inst: {}]", hostname, instance.as_str());
+            debug!("[SMTP IN] HELO from {} [inst: {}]", hostname, instance.as_str());
             writer.write_all(b"250 Hello\r\n").await?;
         } else if cmd.starts_with("EHLO") {
             let hostname = cmd.split_whitespace().nth(1).unwrap_or("unknown");
-            info!("[SMTP IN] EHLO from {} [inst: {}]", hostname, instance.as_str());
+            debug!("[SMTP IN] EHLO from {} [inst: {}]", hostname, instance.as_str());
             writer.write_all(
                 b"250-Hello\r\n250-SIZE 52428800\r\n250-8BITMIME\r\n250 ENHANCEDSTATUSCODES\r\n"
             ).await?;
         } else if let Some(addr) = cmd.strip_prefix("MAIL FROM:") {
             mail_from = addr.trim().to_string();
-            info!("[SMTP IN] MAIL FROM: {} [inst: {}]", mail_from, instance.as_str());
+            debug!("[SMTP IN] MAIL FROM: {} [inst: {}]", mail_from, instance.as_str());
             writer.write_all(b"250 Ok\r\n").await?;
         } else if let Some(addr) = cmd.strip_prefix("RCPT TO:") {
             rcpt_to = addr.trim().to_string();
@@ -729,15 +733,15 @@ async fn handle_smtp(
                 warn!("[Bans] Rejected RCPT TO: {} (domain banned) [inst: {}]", email, instance.as_str());
                 writer.write_all(b"550 Domain banned\r\n").await?;
             } else {
-                info!("[SMTP IN] RCPT TO: {} [inst: {}]", email, instance.as_str());
+                debug!("[SMTP IN] RCPT TO: {} [inst: {}]", email, instance.as_str());
                 writer.write_all(b"250 Ok\r\n").await?;
             }
         } else if cmd == "DATA" {
             data_mode = true;
-            info!("[SMTP IN] DATA command received [inst: {}]", instance.as_str());
+            debug!("[SMTP IN] DATA command received [inst: {}]", instance.as_str());
             writer.write_all(b"354 End data with <CR><LF>.<CR><LF>\r\n").await?;
         } else if cmd == "QUIT" {
-            info!("[SMTP IN] QUIT command received [inst: {}]", instance.as_str());
+            debug!("[SMTP IN] QUIT command received [inst: {}]", instance.as_str());
             writer.write_all(b"221 Bye\r\n").await?;
             break;
         } else if cmd == "RSET" {
@@ -780,7 +784,7 @@ async fn process_email(
         return Ok(ProcessResult::Rejected("Message too large".to_string()));
     }
 
-    info!("📧 Processing email — Raw size: {} bytes [inst: {}]", data.len(), ctx.instance.as_str());
+    debug!("📧 Processing email — Raw size: {} bytes [inst: {}]", data.len(), ctx.instance.as_str());
 
     let recipient_email = extract_email(rcpt_to).to_lowercase();
     let from_address    = extract_email(mail_from).to_lowercase();
