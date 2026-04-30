@@ -31,9 +31,13 @@ const DB_POOL_MIN: u32 = 10;
 const DB_ACQUIRE_TIMEOUT_SECS: u64 = 5;
 const DB_IDLE_TIMEOUT_SECS: u64 = 600;
 const DB_MAX_LIFETIME_SECS: u64 = 1800;
-const DEFAULT_SMTP_MAX_SESSIONS: usize = 200;
+const DEFAULT_SMTP_MAX_SESSIONS: usize = 500;
 const DEFAULT_SMTP_MAX_QUEUE: usize = 5000;
-const DEFAULT_SMTP_SESSION_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_SMTP_SESSION_TIMEOUT_SECS: u64 = 60;
+// Per-line idle timeout: if a client doesn't send the next SMTP command within
+// this window, drop the connection. Stops dead/stalled senders from squatting
+// on a session slot for the full session timeout.
+const DEFAULT_SMTP_IDLE_TIMEOUT_SECS: u64 = 30;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Circuit Breaker for DB failures
@@ -110,9 +114,33 @@ struct ProcessContext {
 // Main Entry Point
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
+
+    // Build tokio runtime with configurable worker threads. Defaults to 2× CPU
+    // count (I/O-bound workload — most session time is spent waiting on the
+    // network). Override with TOKIO_WORKER_THREADS env var.
+    let worker_threads: usize = env::var("TOKIO_WORKER_THREADS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| (num_cpus_or_default() * 2).max(4));
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()?;
+
+    rt.block_on(async_main(worker_threads))
+}
+
+/// Best-effort CPU count without pulling in num_cpus crate.
+fn num_cpus_or_default() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+}
+
+async fn async_main(worker_threads: usize) -> anyhow::Result<()> {
 
     let connection_counter = Arc::new(AtomicUsize::new(0));
 
@@ -124,6 +152,7 @@ async fn main() -> anyhow::Result<()> {
         .compact()
         .init();
     info!("=== SMTP Service (Receive Only) ===");
+    info!("Tokio runtime: {} worker threads", worker_threads);
 
     // ── Environment Variables ──────────────────────────────────────────────
     let database_url = env::var("DATABASE_URL")?;
@@ -151,6 +180,10 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| DEFAULT_SMTP_SESSION_TIMEOUT_SECS.to_string())
         .parse()
         .unwrap_or(DEFAULT_SMTP_SESSION_TIMEOUT_SECS);
+    let smtp_idle_timeout_secs: u64 = env::var("SMTP_IDLE_TIMEOUT_SECS")
+        .unwrap_or_else(|_| DEFAULT_SMTP_IDLE_TIMEOUT_SECS.to_string())
+        .parse()
+        .unwrap_or(DEFAULT_SMTP_IDLE_TIMEOUT_SECS);
 
     // ── PostgreSQL Pool with Health Check ─────────────────────────────────
     let postgres_pool = PgPoolOptions::new()
@@ -359,8 +392,8 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // ── SMTP Listener ──────────────────────────────────────────────────────
-    info!("Concurrency: max_sessions={} max_queue={} session_timeout={}s",
-          smtp_max_sessions, smtp_max_queue, smtp_session_timeout_secs);
+    info!("Concurrency: max_sessions={} max_queue={} session_timeout={}s idle_timeout={}s",
+          smtp_max_sessions, smtp_max_queue, smtp_session_timeout_secs, smtp_idle_timeout_secs);
     let semaphore = Arc::new(Semaphore::new(smtp_max_sessions));
     let max_queue = smtp_max_queue;
     let queue_counter = Arc::new(AtomicUsize::new(0));
@@ -392,6 +425,7 @@ async fn main() -> anyhow::Result<()> {
         let batch_sender    = batch_sender.clone();
         let cb_open         = cb_open_for_handler.clone();
         let session_timeout = Duration::from_secs(smtp_session_timeout_secs);
+        let idle_timeout    = Duration::from_secs(smtp_idle_timeout_secs);
         let handlers         = handlers.clone();
         let shutdown_req     = shutdown_requested.clone();
 
@@ -426,6 +460,7 @@ async fn main() -> anyhow::Result<()> {
                     batch_sender:        batch_sender.clone(),
                     cb_open:             cb_open.clone(),
                     shutdown_requested:  shutdown_req,
+                    idle_timeout,
                 }, instance.clone()),
             ).await;
 
@@ -538,6 +573,7 @@ struct SmtpHandlerContext {
     batch_sender:       Arc<ArcSwap<mpsc::Sender<EmailInsert>>>,
     cb_open:            Arc<AtomicBool>,
     shutdown_requested: Arc<AtomicBool>,
+    idle_timeout:       Duration,
 }
 
 async fn handle_smtp(
@@ -559,7 +595,20 @@ async fn handle_smtp(
 
     loop {
         buf.clear();
-        let bytes = reader.read_until(b'\n', &mut buf).await?;
+        // Per-line idle timeout: if a sender stalls between commands, drop them
+        // instead of holding the session slot for the full session timeout.
+        let bytes = match tokio::time::timeout(
+            ctx.idle_timeout,
+            reader.read_until(b'\n', &mut buf),
+        ).await {
+            Ok(r) => r?,
+            Err(_) => {
+                warn!("[SMTP] Idle timeout ({}s) — closing connection [inst: {}]",
+                      ctx.idle_timeout.as_secs(), instance.as_str());
+                let _ = writer.write_all(b"421 Idle timeout - closing connection\r\n").await;
+                break;
+            }
+        };
         if bytes == 0 { break; }
 
         // FIX #16: Check shutdown flag on every loop iteration
