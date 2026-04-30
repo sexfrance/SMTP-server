@@ -998,7 +998,13 @@ async fn send_with_retry(
 // Domain & Bans Helpers (O(1) primary lookups)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// FIX #9: O(1) domain check using separate exact + TLD sets.
+/// O(labels) domain check.
+///
+/// Walks every ancestor suffix of the domain and checks both sets at each level.
+/// For "a.b.example.com" we check: "a.b.example.com" → "b.example.com" →
+/// "example.com" → "com". A hit in `whitelist_exact` means the domain or one
+/// of its parents is registered (so subdomains pass too). A hit in
+/// `whitelist_tlds` means a `*.<suffix>` wildcard was registered.
 fn is_domain_allowed_fast(
     domain: &str,
     whitelist_exact: &HashSet<String>,
@@ -1009,21 +1015,16 @@ fn is_domain_allowed_fast(
     }
 
     let domain_lower = domain.to_lowercase();
-
-    // O(1) exact match
-    if whitelist_exact.contains(&domain_lower) {
-        return true;
-    }
-
-    // O(1) TLD wildcard match — extract TLD from domain, e.g. "spam.ru" → "ru"
-    if let Some(dot_pos) = domain_lower.find('.') {
-        let tld = &domain_lower[dot_pos + 1..];
-        if !tld.is_empty() && whitelist_tlds.contains(tld) {
+    let mut current: &str = &domain_lower;
+    loop {
+        if whitelist_exact.contains(current) || whitelist_tlds.contains(current) {
             return true;
         }
+        match current.find('.') {
+            Some(idx) => current = &current[idx + 1..],
+            None => return false,
+        }
     }
-
-    false
 }
 
 async fn load_domain_whitelist(
@@ -1042,17 +1043,15 @@ async fn load_domain_whitelist(
             for domain in res {
                 let d = domain.domain.to_lowercase();
                 if let Some(stripped) = d.strip_prefix("*.") {
-                    // It's a wildcard — strip prefix and add as TLD
+                    // Explicit wildcard, e.g. "*.cfd" → matches everything under .cfd
                     tlds.insert(stripped.to_string());
                 } else {
-                    exact.insert(d.clone());
-                    // Also add the TLD for convenience
-                    if let Some(dot_pos) = d.find('.') {
-                        let tld = &d[dot_pos + 1..];
-                        if !tld.is_empty() {
-                            tlds.insert(tld.to_string());
-                        }
-                    }
+                    // Plain entry — matches the domain itself and any subdomain
+                    // (subdomain support is provided by ancestor walk in
+                    // is_domain_allowed_fast). We deliberately do NOT add the
+                    // bare TLD here, otherwise registering "yurevia.cfd" would
+                    // silently accept every other .cfd domain on the internet.
+                    exact.insert(d);
                 }
             }
 
