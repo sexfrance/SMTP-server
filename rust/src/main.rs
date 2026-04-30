@@ -12,6 +12,7 @@ use std::{
 use mailparse::{parse_mail, MailHeaderMap};
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use tracing::{info, warn, error};
+use arc_swap::ArcSwap;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants & Tunables
@@ -19,10 +20,11 @@ use tracing::{info, warn, error};
 const MAX_EMAIL_SIZE_BYTES: usize = 50 * 1024 * 1024; // 50 MB hard cap
 const BATCH_CHANNEL_SIZE: usize = 5000;                // was 2000
 const BATCH_FLUSH_SIZE: usize = 1000;                   // flush when buffer reaches this
-const BATCH_FLUSH_INTERVAL_MS: u64 = 200;               // flush every 200ms minimum
+const BATCH_FLUSH_INTERVAL_MS: u64 = 50;                // flush every 50ms minimum
 const BATCH_FLUSH_TIMEOUT_SECS: u64 = 30;              // hard timeout per flush
 const DOMAIN_POLL_INTERVAL_SECS: u64 = 60;
 const BANS_POLL_INTERVAL_SECS: u64 = 60;
+const PRIVATE_EMAIL_POLL_INTERVAL_SECS: u64 = 30;
 const HEARTBEAT_INTERVAL_SECS: u64 = 60;
 const DB_POOL_MAX: u32 = 80;
 const DB_POOL_MIN: u32 = 10;
@@ -94,13 +96,14 @@ enum ProcessResult {
 /// Bundles everything process_email needs from the SMTP handler's scope.
 /// Avoids the clippy `too_many_arguments` warning and makes call sites cleaner.
 struct ProcessContext {
-    postgres_pool:     PgPool,
-    whitelist_exact:  Arc<RwLock<HashSet<String>>>,
-    whitelist_tlds:   Arc<RwLock<HashSet<String>>>,
-    bans_cache:       Arc<RwLock<BansCache>>,
-    batch_sender:     Arc<Mutex<mpsc::Sender<EmailInsert>>>,
-    cb_open:          Arc<AtomicBool>,
-    instance:         Arc<String>,
+    postgres_pool:      PgPool,
+    whitelist_exact:    Arc<RwLock<HashSet<String>>>,
+    whitelist_tlds:     Arc<RwLock<HashSet<String>>>,
+    bans_cache:         Arc<RwLock<BansCache>>,
+    private_email_cache: Arc<ArcSwap<HashSet<String>>>,
+    batch_sender:       Arc<ArcSwap<mpsc::Sender<EmailInsert>>>,
+    cb_open:            Arc<AtomicBool>,
+    instance:           Arc<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -215,6 +218,10 @@ async fn main() -> anyhow::Result<()> {
     let domain_whitelist_exact: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
     let domain_whitelist_tlds:  Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
     let bans_cache: Arc<RwLock<BansCache>> = Arc::new(RwLock::new(BansCache::default()));
+    // FIX: in-memory cache of private_email addresses to avoid a per-message
+    // SELECT round-trip. Refreshed on a background poll.
+    let private_email_cache: Arc<ArcSwap<HashSet<String>>> =
+        Arc::new(ArcSwap::from_pointee(HashSet::new()));
 
     // ── Circuit Breaker for DB failures ────────────────────────────────
     // Tracks consecutive DB flush failures so we reject new emails fast
@@ -232,8 +239,10 @@ async fn main() -> anyhow::Result<()> {
     // FIX #2 & #7: Larger channel + restartable supervisor
     let (batch_tx, _batch_rx) = mpsc::channel::<EmailInsert>(BATCH_CHANNEL_SIZE);
     let (shutdown_tx, shutdown_rx) = watch::channel(());
-    // Mutex wrapper so the sender can be atomically replaced on worker restart
-    let batch_sender = Arc::new(Mutex::new(batch_tx));
+    // ArcSwap so the sender can be atomically replaced on worker restart
+    // without serializing every handler through a mutex.
+    let batch_sender: Arc<ArcSwap<mpsc::Sender<EmailInsert>>> =
+        Arc::new(ArcSwap::from_pointee(batch_tx));
     let batch_sender_for_swap = batch_sender.clone();
     let pool_for_supervisor = postgres_pool.clone();
 
@@ -250,12 +259,10 @@ async fn main() -> anyhow::Result<()> {
             let worker_shutdown_rx = shutdown_rx.take()
                 .unwrap_or_else(|| watch::channel(()).1);
 
-            // Atomically swap the new sender into the Arc — new SMTP sessions
-            // will clone the fresh sender; old sessions still hold old clones
-            {
-                let mut guard = batch_sender_for_swap.lock().await;
-                *guard = tx;
-            }
+            // Atomically swap the new sender into the ArcSwap — new sends
+            // see the fresh sender on their next load(); in-flight retries
+            // re-load on each attempt.
+            batch_sender_for_swap.store(Arc::new(tx));
 
             warn!("Batch supervisor: spawning new worker");
             let handle = tokio::spawn(batch_worker(
@@ -314,6 +321,19 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Private-email cache: only enable polling if the table actually exists.
+    if has_private_email {
+        // Initial load
+        if let Err(e) = load_private_emails(&postgres_pool, private_email_cache.clone()).await {
+            warn!("⚠ Initial private_email load failed: {} — will retry on next poll", e);
+        }
+        let cache = private_email_cache.clone();
+        let pool  = postgres_pool.clone();
+        tokio::spawn(async move {
+            poll_private_emails(pool, cache).await;
+        });
+    }
+
     // ── Heartbeat (with reusable client) ────────────────────────────────
     if let Some(hb_url) = heartbeat_url {
         tokio::spawn(heartbeat_loop(hb_url));
@@ -343,7 +363,7 @@ async fn main() -> anyhow::Result<()> {
           smtp_max_sessions, smtp_max_queue, smtp_session_timeout_secs);
     let semaphore = Arc::new(Semaphore::new(smtp_max_sessions));
     let max_queue = smtp_max_queue;
-    let queue_counter = Arc::new(Mutex::new(0usize));
+    let queue_counter = Arc::new(AtomicUsize::new(0));
 
     let listener = TcpListener::bind(("0.0.0.0", listen_port)).await?;
     info!("✓ SMTP Receiver running on port {}", listen_port);
@@ -365,6 +385,7 @@ async fn main() -> anyhow::Result<()> {
         let whitelist_exact = domain_whitelist_exact.clone();
         let whitelist_tlds  = domain_whitelist_tlds.clone();
         let bans_cache      = bans_cache.clone();
+        let private_cache   = private_email_cache.clone();
         let semaphore       = semaphore.clone();
         let queue_counter   = queue_counter.clone();
         let connection_counter = connection_counter.clone();
@@ -380,40 +401,31 @@ async fn main() -> anyhow::Result<()> {
             let conn_slot = (connection_counter.fetch_add(1, Ordering::Relaxed) % 50) + 1;
             let instance = Arc::new(format!("slot:{}", conn_slot));
 
-            let queue_result = {
-                let mut q = queue_counter.lock().await;
-                if *q >= max_queue {
-                    None
-                } else {
-                    *q += 1;
-                    Some(*q)
-                }
-            };
-
-            let queue_size = match queue_result {
-                Some(n) => n,
-                None => {
-                    warn!("Server busy, rejecting {} [Queue: full/{}] [inst: {}]",
-                          addr, max_queue, instance.as_str());
-                    let (_, mut w) = socket.into_split();
-                    let _ = w.write_all(b"421 Service temporarily unavailable - try again later\r\n").await;
-                    return;
-                }
-            };
+            // Lock-free reservation: fetch_add then bail+rollback if over cap.
+            let reserved = queue_counter.fetch_add(1, Ordering::AcqRel) + 1;
+            if reserved > max_queue {
+                queue_counter.fetch_sub(1, Ordering::AcqRel);
+                warn!("Server busy, rejecting {} [Queue: full/{}] [inst: {}]",
+                      addr, max_queue, instance.as_str());
+                let (_, mut w) = socket.into_split();
+                let _ = w.write_all(b"421 Service temporarily unavailable - try again later\r\n").await;
+                return;
+            }
 
             info!("[SMTP IN] New connection from {} -> local [Queue: {}/{}] [inst: {}]",
-                  addr, queue_size, max_queue, instance.as_str());
+                  addr, reserved, max_queue, instance.as_str());
 
             let result = tokio::time::timeout(
                 session_timeout,
                 handle_smtp(socket, SmtpHandlerContext {
-                    postgres_pool:   postgres_pool.clone(),
-                    whitelist_exact: whitelist_exact.clone(),
-                    whitelist_tlds: whitelist_tlds.clone(),
-                    bans_cache:     bans_cache.clone(),
-                    batch_sender:   batch_sender.clone(),
-                    cb_open:       cb_open.clone(),
-                    shutdown_requested: shutdown_req,
+                    postgres_pool:       postgres_pool.clone(),
+                    whitelist_exact:     whitelist_exact.clone(),
+                    whitelist_tlds:      whitelist_tlds.clone(),
+                    bans_cache:          bans_cache.clone(),
+                    private_email_cache: private_cache.clone(),
+                    batch_sender:        batch_sender.clone(),
+                    cb_open:             cb_open.clone(),
+                    shutdown_requested:  shutdown_req,
                 }, instance.clone()),
             ).await;
 
@@ -423,11 +435,7 @@ async fn main() -> anyhow::Result<()> {
                 Err(_) => warn!("SMTP session timeout for {} [inst: {}]", addr, instance.as_str()),
             }
 
-            let queue_size = {
-                let mut q = queue_counter.lock().await;
-                *q -= 1;
-                *q
-            };
+            let queue_size = queue_counter.fetch_sub(1, Ordering::AcqRel).saturating_sub(1);
             info!("[SMTP OUT] Connection closed from {} [Queue: {}/{}] [inst: {}]",
                   addr, queue_size, max_queue, instance.as_str());
         });
@@ -522,12 +530,13 @@ async fn batch_worker(
 
 /// Shared read-only state passed to every SMTP handler.
 struct SmtpHandlerContext {
-    postgres_pool:   PgPool,
-    whitelist_exact: Arc<RwLock<HashSet<String>>>,
-    whitelist_tlds:  Arc<RwLock<HashSet<String>>>,
-    bans_cache:     Arc<RwLock<BansCache>>,
-    batch_sender:   Arc<Mutex<mpsc::Sender<EmailInsert>>>,
-    cb_open:       Arc<AtomicBool>,
+    postgres_pool:      PgPool,
+    whitelist_exact:    Arc<RwLock<HashSet<String>>>,
+    whitelist_tlds:     Arc<RwLock<HashSet<String>>>,
+    bans_cache:         Arc<RwLock<BansCache>>,
+    private_email_cache: Arc<ArcSwap<HashSet<String>>>,
+    batch_sender:       Arc<ArcSwap<mpsc::Sender<EmailInsert>>>,
+    cb_open:            Arc<AtomicBool>,
     shutdown_requested: Arc<AtomicBool>,
 }
 
@@ -574,74 +583,41 @@ async fn handle_smtp(
                     continue;
                 }
 
-                let email_bytes  = std::mem::take(&mut email_data);
-                let rcpt_clone   = rcpt_to.clone();
-                let mail_clone   = mail_from.clone();
-                // Clone the Arcs BEFORE the async block so the loop can reuse the originals
-                let pool_cloned  = ctx.postgres_pool.clone();
-                let wl_ex_cloned = ctx.whitelist_exact.clone();
-                let wl_tl_cloned = ctx.whitelist_tlds.clone();
-                let bans_cloned  = ctx.bans_cache.clone();
-                let batch_cloned = ctx.batch_sender.clone();
-                let cb_cloned    = ctx.cb_open.clone();
-                let inst_cloned  = instance.clone();
+                let email_bytes = std::mem::take(&mut email_data);
+                let rcpt_clone  = rcpt_to.clone();
+                let mail_clone  = mail_from.clone();
 
-                // FIX #1: Await processing BEFORE sending 250
-                // Use tokio::spawn with oneshot to get the result
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                let handle = tokio::spawn(async move {
-                    let ctx = ProcessContext {
-                        postgres_pool:    pool_cloned,
-                        whitelist_exact:  wl_ex_cloned,
-                        whitelist_tlds:   wl_tl_cloned,
-                        bans_cache:       bans_cloned,
-                        batch_sender:     batch_cloned,
-                        cb_open:          cb_cloned,
-                        instance:         inst_cloned,
-                    };
-                    let result = process_email(
-                        email_bytes,
-                        &rcpt_clone,
-                        &mail_clone,
-                        &ctx,
-                    ).await;
-                    let _ = tx.send(result);
-                });
-
-                // Wait for processing to complete (or timeout)
-                let process_result = tokio::time::timeout(
-                    Duration::from_secs(30),
-                    rx,
+                // Inline processing (no spawn+oneshot) — saves a runtime hop and
+                // a redundant 30s timeout on top of the existing session timeout.
+                let process_ctx = ProcessContext {
+                    postgres_pool:       ctx.postgres_pool.clone(),
+                    whitelist_exact:     ctx.whitelist_exact.clone(),
+                    whitelist_tlds:      ctx.whitelist_tlds.clone(),
+                    bans_cache:          ctx.bans_cache.clone(),
+                    private_email_cache: ctx.private_email_cache.clone(),
+                    batch_sender:        ctx.batch_sender.clone(),
+                    cb_open:             ctx.cb_open.clone(),
+                    instance:            instance.clone(),
+                };
+                let process_result = process_email(
+                    email_bytes,
+                    &rcpt_clone,
+                    &mail_clone,
+                    &process_ctx,
                 ).await;
 
-                // FIX #11: Abort the background task if timeout fires — prevents
-                // orphaned DB queries consuming connection pool slots after client
-                // has already retried elsewhere.
-                if process_result.is_err() {
-                    handle.abort();
-                }
-
                 match process_result {
-                    Ok(Ok(Ok(ProcessResult::Accepted))) => {
+                    Ok(ProcessResult::Accepted) => {
                         writer.write_all(b"250 Ok: Message accepted\r\n").await?;
                         info!("✓ Email accepted for processing [inst: {}]", instance.as_str());
                     }
-                    Ok(Ok(Ok(ProcessResult::Rejected(reason)))) => {
+                    Ok(ProcessResult::Rejected(reason)) => {
                         writer.write_all(format!("550 {}\r\n", reason).as_bytes()).await?;
                         warn!("[SMTP] Email rejected: {} [inst: {}]", reason, instance.as_str());
                     }
-                    Ok(Ok(Err(e))) => {
+                    Err(e) => {
                         error!("Email processing error: {} [inst: {}]", e, instance.as_str());
                         writer.write_all(b"451 Requested action aborted - try again later\r\n").await?;
-                    }
-                    Ok(Err(_)) => {
-                        // Sender dropped without sending — treat as error
-                        error!("Email processing sender dropped [inst: {}]", instance.as_str());
-                        writer.write_all(b"451 Requested action aborted - try again later\r\n").await?;
-                    }
-                    Err(_) => {
-                        error!("Email processing timeout [inst: {}]", instance.as_str());
-                        writer.write_all(b"451 Requested action aborted - timeout\r\n").await?;
                     }
                 }
                 // FIX: Reset DATA session state after every email completes
@@ -688,14 +664,13 @@ async fn handle_smtp(
             let email = extract_email(&rcpt_to);
             let domain = email.split('@').nth(1).unwrap_or("").to_lowercase();
 
-            // FIX #9: O(1) domain check
-            let (whitelist_exact_guard, whitelist_tlds_guard) = {
+            // FIX #9: O(1) domain check. Hold read guards over the sync lookup —
+            // no per-email HashSet clone.
+            let domain_allowed = {
                 let ex = ctx.whitelist_exact.read().await;
                 let tl = ctx.whitelist_tlds.read().await;
-                (ex.clone(), tl.clone())
+                is_domain_allowed_fast(&domain, &ex, &tl)
             };
-
-            let domain_allowed = is_domain_allowed_fast(&domain, &whitelist_exact_guard, &whitelist_tlds_guard);
 
             if !domain_allowed {
                 warn!("[Domains] Rejected RCPT TO: {} (domain not allowed) [inst: {}]",
@@ -763,14 +738,14 @@ async fn process_email(
 
     let domain = recipient_email.split('@').nth(1).unwrap_or("").to_lowercase();
 
-    // Domain allowed check
-    let (wl_exact, wl_tlds) = {
+    // Domain allowed check — hold read guards over the synchronous lookup
+    // instead of cloning the entire HashSet on every email.
+    {
         let ex = ctx.whitelist_exact.read().await;
         let tl = ctx.whitelist_tlds.read().await;
-        (ex.clone(), tl.clone())
-    };
-    if !is_domain_allowed_fast(&domain, &wl_exact, &wl_tlds) {
-        return Ok(ProcessResult::Rejected("Domain not allowed".to_string()));
+        if !is_domain_allowed_fast(&domain, &ex, &tl) {
+            return Ok(ProcessResult::Rejected("Domain not allowed".to_string()));
+        }
     }
 
     // Bans check
@@ -874,55 +849,45 @@ async fn process_email(
     info!("✉ Parsed email for {} from {} — Subject: '{}' [inst: {}]",
           recipient_email, from_address, subject, ctx.instance.as_str());
 
-    // Private email path — FIX #4: table might not exist, handle gracefully
-    match sqlx::query("SELECT id FROM private_email WHERE email = $1 LIMIT 1")
-        .bind(&recipient_email)
-        .fetch_optional(&ctx.postgres_pool)
-        .await
-    {
-        Ok(Some(_)) => {
-            let to_addrs_vec = vec![recipient_email.clone()];
-            let email_insert = EmailInsert {
-                mailbox_owner: recipient_email.clone(),
-                mailbox: "INBOX".to_string(),
-                subject: subject.clone(),
-                body: text_body.clone(),
-                html: html_body.clone(),
-                from_addr: from_address.clone(),
-                to_addrs: to_addrs_vec,
-                size: raw_size,
-            };
+    // Private email path — O(1) in-memory cache lookup instead of a per-message
+    // SELECT. Cache is refreshed by poll_private_emails. New private addresses
+    // may take up to PRIVATE_EMAIL_POLL_INTERVAL_SECS to propagate.
+    let is_private = ctx.private_email_cache.load().contains(&recipient_email);
+    if is_private {
+        let to_addrs_vec = vec![recipient_email.clone()];
+        let email_insert = EmailInsert {
+            mailbox_owner: recipient_email.clone(),
+            mailbox: "INBOX".to_string(),
+            subject: subject.clone(),
+            body: text_body.clone(),
+            html: html_body.clone(),
+            from_addr: from_address.clone(),
+            to_addrs: to_addrs_vec,
+            size: raw_size,
+        };
 
-            // FIX #2: Retry with backoff if channel is full
-            match send_with_retry(&ctx.batch_sender, email_insert).await {
-                Ok(_) => {
-                    info!("✓ Queued email for private user: {} -> {} [inst: {}]",
-                          from_address, recipient_email, ctx.instance.as_str());
-                    // Background update — fire and forget
-                    let pool = ctx.postgres_pool.clone();
-                    let email = recipient_email.clone();
-                    tokio::spawn(async move {
-                        let _ = sqlx::query(
-                            "UPDATE private_email SET last_updated_at = NOW() WHERE email = $1"
-                        )
-                        .bind(&email)
-                        .execute(&pool)
-                        .await;
-                    });
-                }
-                Err(e) => {
-                    error!("Failed to queue private email after retries: {} [inst: {}]", e, ctx.instance.as_str());
-                    return Err(anyhow::anyhow!("Failed to queue private email: {}", e));
-                }
+        match send_with_retry(&ctx.batch_sender, email_insert).await {
+            Ok(_) => {
+                info!("✓ Queued email for private user: {} -> {} [inst: {}]",
+                      from_address, recipient_email, ctx.instance.as_str());
+                // Background update — fire and forget
+                let pool = ctx.postgres_pool.clone();
+                let email = recipient_email.clone();
+                tokio::spawn(async move {
+                    let _ = sqlx::query(
+                        "UPDATE private_email SET last_updated_at = NOW() WHERE email = $1"
+                    )
+                    .bind(&email)
+                    .execute(&pool)
+                    .await;
+                });
             }
-            return Ok(ProcessResult::Accepted);
+            Err(e) => {
+                error!("Failed to queue private email after retries: {} [inst: {}]", e, ctx.instance.as_str());
+                return Err(anyhow::anyhow!("Failed to queue private email: {}", e));
+            }
         }
-        Ok(None) => { /* not a private email, continue */ }
-        Err(e) => {
-            // Table might not exist — log and continue to temp email path
-            warn!("private_email check failed (table may not exist): {:?} [inst: {}]",
-                  e, ctx.instance.as_str());
-        }
+        return Ok(ProcessResult::Accepted);
     }
 
     // Temp email path
@@ -951,35 +916,28 @@ async fn process_email(
 }
 
 /// FIX #2: Retry send with exponential backoff (3 attempts, max 500ms delay).
-/// Lock is held only during the synchronous try_send — no await under the lock.
-/// If the channel is disconnected, re-acquires lock to get the fresh sender from
-/// the supervisor's last swap.
+/// Lock-free: ArcSwap::load() returns a guard with no contention. Each retry
+/// re-loads, so a worker restart that swaps in a fresh sender is picked up
+/// transparently.
 async fn send_with_retry(
-    sender: &Arc<tokio::sync::Mutex<mpsc::Sender<EmailInsert>>>,
+    sender: &Arc<ArcSwap<mpsc::Sender<EmailInsert>>>,
     email: EmailInsert,
 ) -> anyhow::Result<()> {
     let mut delay_ms: u64 = 10;
     for attempt in 1..=4 {
-        // Acquire lock only for the duration of try_send (sync call, ~µs)
-        let guard = sender.lock().await;
-        match guard.try_send(email.clone()) {
-            Ok(()) => {
-                drop(guard);
-                return Ok(());
-            }
+        let s = sender.load();
+        match s.try_send(email.clone()) {
+            Ok(()) => return Ok(()),
             Err(_e) if attempt <= 3 => {
-                // Either Full or Disconnected — back off and retry
-                drop(guard);
+                drop(s);
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 delay_ms = delay_ms.saturating_mul(2).min(500);
             }
             Err(e) => {
-                drop(guard);
                 return Err(anyhow::anyhow!("Channel send failed after 4 attempts: {}", e));
             }
         }
     }
-    // FIX #17: The loop always returns or breaks; this satisfies the compiler.
     Ok(())
 }
 
@@ -1139,6 +1097,41 @@ async fn load_bans(pool: &PgPool, bans_cache: Arc<RwLock<BansCache>>) -> Result<
     info!("✅ Loaded bans (email_exact={}, email_contains={}, domains={}, domain_tlds={})",
           c.email_exact.len(), c.email_contains.len(), c.domain.len(), c.domain_tlds.len());
     Ok(())
+}
+
+/// Load all private_email addresses into the in-memory cache.
+async fn load_private_emails(
+    pool: &PgPool,
+    cache: Arc<ArcSwap<HashSet<String>>>,
+) -> anyhow::Result<()> {
+    let rows: Vec<(String,)> = sqlx::query_as("SELECT email FROM private_email")
+        .fetch_all(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("private_email query failed: {}", e))?;
+
+    let mut set = HashSet::with_capacity(rows.len());
+    for (email,) in rows {
+        set.insert(email.trim().to_lowercase());
+    }
+    let n = set.len();
+    cache.store(Arc::new(set));
+    info!("✅ Loaded {} private_email addresses into cache", n);
+    Ok(())
+}
+
+async fn poll_private_emails(pool: PgPool, cache: Arc<ArcSwap<HashSet<String>>>) {
+    let mut poll_interval = tokio::time::interval(
+        Duration::from_secs(PRIVATE_EMAIL_POLL_INTERVAL_SECS)
+    );
+    // Jitter to avoid thundering herd on restart
+    tokio::time::sleep(Duration::from_millis(rand_u64(15_000))).await;
+
+    loop {
+        poll_interval.tick().await;
+        if let Err(e) = load_private_emails(&pool, cache.clone()).await {
+            warn!("⚠ private_email poll failed: {} — keeping last known cache", e);
+        }
+    }
 }
 
 async fn poll_bans(pool: PgPool, bans_cache: Arc<RwLock<BansCache>>) {
