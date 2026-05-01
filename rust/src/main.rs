@@ -20,7 +20,7 @@ use arc_swap::ArcSwap;
 const MAX_EMAIL_SIZE_BYTES: usize = 50 * 1024 * 1024; // 50 MB hard cap
 const BATCH_CHANNEL_SIZE: usize = 5000;                // was 2000
 const BATCH_FLUSH_SIZE: usize = 1000;                   // flush when buffer reaches this
-const BATCH_FLUSH_INTERVAL_MS: u64 = 100;               // flush every 100ms minimum
+const BATCH_FLUSH_INTERVAL_MS: u64 = 25;                // flush every 25ms minimum
 const BATCH_FLUSH_TIMEOUT_SECS: u64 = 30;              // hard timeout per flush
 const DOMAIN_POLL_INTERVAL_SECS: u64 = 60;
 const BANS_POLL_INTERVAL_SECS: u64 = 60;
@@ -546,6 +546,23 @@ async fn batch_worker(
     cb_last_failure: Arc<std::sync::Mutex<std::time::Instant>>,
 ) {
     let mut buffer: Vec<EmailInsert> = Vec::with_capacity(BATCH_FLUSH_SIZE);
+
+    // Inbox-row cache: addresses already known to exist in the inbox table.
+    // Skips redundant `INSERT ... ON CONFLICT DO NOTHING` round-trips for
+    // owners we've already inserted (or that pre-existed). False negatives
+    // (cache says absent but row exists) are harmless — Postgres handles the
+    // conflict. False positives can't happen for our own inserts.
+    let mut inbox_cache: HashSet<String> = match load_inbox_cache(&postgres_pool).await {
+        Ok(set) => {
+            info!("📦 Inbox cache loaded with {} addresses", set.len());
+            set
+        }
+        Err(e) => {
+            warn!("⚠ Failed to preload inbox cache, starting empty: {}", e);
+            HashSet::new()
+        }
+    };
+
     let mut flush_interval = tokio::time::interval(Duration::from_millis(BATCH_FLUSH_INTERVAL_MS));
     flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -556,7 +573,7 @@ async fn batch_worker(
             // Check shutdown first
             _ = shutdown_rx.changed() => {
                 if !buffer.is_empty() {
-                    flush_batch(&postgres_pool, &mut buffer,
+                    flush_batch(&postgres_pool, &mut buffer, &mut inbox_cache,
                                 &cb_failures, &cb_open, &cb_last_failure).await;
                 }
                 warn!("Batch worker: shutdown signal received");
@@ -568,13 +585,13 @@ async fn batch_worker(
                     Some(email) => {
                         buffer.push(email);
                         if buffer.len() >= BATCH_FLUSH_SIZE {
-                            flush_batch(&postgres_pool, &mut buffer,
+                            flush_batch(&postgres_pool, &mut buffer, &mut inbox_cache,
                                         &cb_failures, &cb_open, &cb_last_failure).await;
                         }
                     }
                     None => {
                         if !buffer.is_empty() {
-                            flush_batch(&postgres_pool, &mut buffer,
+                            flush_batch(&postgres_pool, &mut buffer, &mut inbox_cache,
                                         &cb_failures, &cb_open, &cb_last_failure).await;
                         }
                         warn!("Batch worker: channel closed, shutting down");
@@ -585,12 +602,26 @@ async fn batch_worker(
 
             _ = flush_interval.tick() => {
                 if !buffer.is_empty() {
-                    flush_batch(&postgres_pool, &mut buffer,
+                    flush_batch(&postgres_pool, &mut buffer, &mut inbox_cache,
                                 &cb_failures, &cb_open, &cb_last_failure).await;
                 }
             }
         }
     }
+}
+
+/// Load all known inbox addresses into the cache so subsequent batches can
+/// skip the redundant `ON CONFLICT DO NOTHING` insert for already-existing rows.
+async fn load_inbox_cache(pool: &PgPool) -> anyhow::Result<HashSet<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as("SELECT email_address FROM inbox")
+        .fetch_all(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("inbox preload query failed: {}", e))?;
+    let mut set = HashSet::with_capacity(rows.len());
+    for (addr,) in rows {
+        set.insert(addr);
+    }
+    Ok(set)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1287,6 +1318,7 @@ async fn is_email_banned(from_lower: &str, bans_cache: &Arc<RwLock<BansCache>>) 
 async fn flush_batch(
     pool: &PgPool,
     buffer: &mut Vec<EmailInsert>,
+    inbox_cache: &mut HashSet<String>,
     cb_failures: &Arc<AtomicUsize>,
     cb_open: &Arc<AtomicBool>,
     cb_last_failure: &Arc<std::sync::Mutex<std::time::Instant>>,
@@ -1299,7 +1331,7 @@ async fn flush_batch(
     // FIX #6: Wrap entire flush in a 30-second timeout
     let result = timeout(
         Duration::from_secs(BATCH_FLUSH_TIMEOUT_SECS),
-        flush_batch_inner(pool, buffer),
+        flush_batch_inner(pool, buffer, inbox_cache),
     ).await;
 
     match result {
@@ -1360,24 +1392,37 @@ async fn circuit_breaker_recovery_task(
     }
 }
 
-async fn flush_batch_inner(pool: &PgPool, buffer: &mut [EmailInsert]) -> anyhow::Result<()> {
+async fn flush_batch_inner(
+    pool: &PgPool,
+    buffer: &mut [EmailInsert],
+    inbox_cache: &mut HashSet<String>,
+) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
 
-    // Unique inbox owners
-    let mut unique_owners: HashSet<&String> = HashSet::new();
-    for email in buffer.iter() {
-        unique_owners.insert(&email.mailbox_owner);
+    // Only insert inbox rows for owners we haven't already seen. Postgres
+    // would otherwise re-check uniqueness and DO NOTHING on every batch —
+    // wasted bind parameters and a wasted round-trip.
+    let mut new_owners: Vec<String> = Vec::new();
+    {
+        let mut seen_in_batch: HashSet<&str> = HashSet::new();
+        for email in buffer.iter() {
+            if !inbox_cache.contains(&email.mailbox_owner)
+                && seen_in_batch.insert(email.mailbox_owner.as_str())
+            {
+                new_owners.push(email.mailbox_owner.clone());
+            }
+        }
     }
 
-    if !unique_owners.is_empty() {
+    if !new_owners.is_empty() {
         let mut inbox_query = sqlx::QueryBuilder::new(
             "INSERT INTO inbox (email_address) "
         );
-        inbox_query.push_values(unique_owners.iter(), |mut b, owner| {
+        inbox_query.push_values(new_owners.iter(), |mut b, owner| {
             b.push_bind(owner);
         });
         inbox_query.push(" ON CONFLICT (email_address) DO NOTHING");
-        // FIX #18: Propagate inbox INSERT errors — do not silently swallow failures.
+        // Propagate inbox INSERT errors — do not silently swallow failures.
         inbox_query.build().execute(&mut *tx).await?;
     }
 
@@ -1398,6 +1443,13 @@ async fn flush_batch_inner(pool: &PgPool, buffer: &mut [EmailInsert]) -> anyhow:
 
     query.build().execute(&mut *tx).await?;
     tx.commit().await?;
+
+    // Only update cache after the transaction commits — otherwise a rolled-back
+    // tx would leave the cache thinking rows exist that don't.
+    for owner in new_owners {
+        inbox_cache.insert(owner);
+    }
+
     info!("✓ Batch committed: {} emails saved", buffer.len());
     Ok(())
 }
