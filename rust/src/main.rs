@@ -33,11 +33,16 @@ const DB_IDLE_TIMEOUT_SECS: u64 = 600;
 const DB_MAX_LIFETIME_SECS: u64 = 1800;
 const DEFAULT_SMTP_MAX_SESSIONS: usize = 500;
 const DEFAULT_SMTP_MAX_QUEUE: usize = 5000;
-const DEFAULT_SMTP_SESSION_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_SMTP_SESSION_TIMEOUT_SECS: u64 = 180;
 // Per-line idle timeout: if a client doesn't send the next SMTP command within
 // this window, drop the connection. Stops dead/stalled senders from squatting
 // on a session slot for the full session timeout.
-const DEFAULT_SMTP_IDLE_TIMEOUT_SECS: u64 = 30;
+//
+// Senders like SendGrid (Discord), Mailgun, SES pool SMTP connections — they
+// open one connection and reuse it for many messages, often with 30-90s pauses
+// between batches. Don't drop below ~90s without measuring; the RFC recommends
+// 5 minutes per command.
+const DEFAULT_SMTP_IDLE_TIMEOUT_SECS: u64 = 90;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Circuit Breaker for DB failures
