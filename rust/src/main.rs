@@ -94,7 +94,8 @@ struct Domain {
 /// for async processing so the SMTP response can be sent accordingly.
 enum ProcessResult {
     Accepted,
-    Rejected(String), // reason
+    Rejected(String),    // 550 — permanent, e.g. domain not allowed / ban hit
+    TempReject(String),  // 451 — temporary, sender MUST retry; e.g. DB/CB issue
 }
 
 /// Bundles everything process_email needs from the SMTP handler's scope.
@@ -108,6 +109,27 @@ struct ProcessContext {
     batch_sender:       Arc<ArcSwap<mpsc::Sender<EmailInsert>>>,
     cb_open:            Arc<AtomicBool>,
     instance:           Arc<String>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Global email stats — lock-free counters printed every 60s
+// ─────────────────────────────────────────────────────────────────────────────
+static STAT_ACCEPTED:     std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static STAT_PERM_REJECT:  std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static STAT_TEMP_REJECT:  std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static STAT_ERROR:        std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+async fn stats_printer_loop() {
+    let mut interval = tokio::time::interval(Duration::from_secs(60));
+    loop {
+        interval.tick().await;
+        let accepted    = STAT_ACCEPTED.load(Ordering::Relaxed);
+        let perm_reject = STAT_PERM_REJECT.load(Ordering::Relaxed);
+        let temp_reject = STAT_TEMP_REJECT.load(Ordering::Relaxed);
+        let errors      = STAT_ERROR.load(Ordering::Relaxed);
+        info!("📊 Stats (lifetime) — accepted: {} | perm-rejected: {} | temp-rejected: {} | errors: {}",
+              accepted, perm_reject, temp_reject, errors);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -382,6 +404,9 @@ async fn async_main(worker_threads: usize) -> anyhow::Result<()> {
         cb_open.clone(),
         cb_last_failure.clone(),
     ));
+
+    // ── Stats printer ────────────────────────────────────────────────────
+    tokio::spawn(stats_printer_loop());
 
     // ── Shutdown Flag ─────────────────────────────────────────────────────
     let shutdown_requested = Arc::new(AtomicBool::new(false));
@@ -661,14 +686,25 @@ async fn handle_smtp(
 
                 match process_result {
                     Ok(ProcessResult::Accepted) => {
+                        STAT_ACCEPTED.fetch_add(1, Ordering::Relaxed);
                         writer.write_all(b"250 Ok: Message accepted\r\n").await?;
                         debug!("✓ Email accepted for processing [inst: {}]", instance.as_str());
                     }
                     Ok(ProcessResult::Rejected(reason)) => {
+                        // 550 = permanent — sender will NOT retry. Only for genuine
+                        // permanent rejections (domain not allowed, ban hit).
+                        STAT_PERM_REJECT.fetch_add(1, Ordering::Relaxed);
                         writer.write_all(format!("550 {}\r\n", reason).as_bytes()).await?;
-                        warn!("[SMTP] Email rejected: {} [inst: {}]", reason, instance.as_str());
+                        warn!("✗ Email permanently rejected: {} [inst: {}]", reason, instance.as_str());
+                    }
+                    Ok(ProcessResult::TempReject(reason)) => {
+                        // 451 = temporary — sender MUST retry in minutes/hours.
+                        STAT_TEMP_REJECT.fetch_add(1, Ordering::Relaxed);
+                        writer.write_all(format!("451 {}\r\n", reason).as_bytes()).await?;
+                        warn!("⏳ Email temp-rejected (will retry): {} [inst: {}]", reason, instance.as_str());
                     }
                     Err(e) => {
+                        STAT_ERROR.fetch_add(1, Ordering::Relaxed);
                         error!("Email processing error: {} [inst: {}]", e, instance.as_str());
                         writer.write_all(b"451 Requested action aborted - try again later\r\n").await?;
                     }
@@ -771,10 +807,12 @@ async fn process_email(
     mail_from: &str,
     ctx: &ProcessContext,
 ) -> anyhow::Result<ProcessResult> {
-    // FIX #9: Circuit breaker — reject fast without consuming channel buffer
+    // Circuit breaker — reject fast without consuming channel buffer.
+    // Use 451 (TempReject) so senders retry instead of permanently dropping
+    // the email during DB outages.
     if ctx.cb_open.load(Ordering::Relaxed) {
-        return Ok(ProcessResult::Rejected(
-            "Service temporarily unavailable - please try again later".to_string()
+        return Ok(ProcessResult::TempReject(
+            "Service temporarily unavailable - please retry later".to_string()
         ));
     }
 
