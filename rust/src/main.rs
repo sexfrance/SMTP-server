@@ -509,10 +509,15 @@ async fn async_main(worker_threads: usize) -> anyhow::Result<()> {
                   addr, queue_size, max_queue, instance.as_str());
         });
 
-        // FIX #16: Register handler so shutdown can await in-flight connections
+        // Register handler so shutdown can await in-flight connections.
+        // Prune finished handles every 1000 connections to prevent the Vec
+        // from growing without bound over long uptimes.
         {
             let mut h = handlers.lock().await;
             h.push(handle);
+            if h.len() % 1000 == 0 {
+                h.retain(|hnd| !hnd.is_finished());
+            }
         }
     }
 
@@ -612,6 +617,11 @@ async fn batch_worker(
 
 /// Load all known inbox addresses into the cache so subsequent batches can
 /// skip the redundant `ON CONFLICT DO NOTHING` insert for already-existing rows.
+///
+/// Addresses are normalized (trim + lowercase) to match the form produced by
+/// `process_email` (which lowercases the recipient before queuing). Without
+/// normalization, any mixed-case rows already in `inbox` would miss the cache
+/// every batch, defeating the optimization.
 async fn load_inbox_cache(pool: &PgPool) -> anyhow::Result<HashSet<String>> {
     let rows: Vec<(String,)> = sqlx::query_as("SELECT email_address FROM inbox")
         .fetch_all(pool)
@@ -619,7 +629,7 @@ async fn load_inbox_cache(pool: &PgPool) -> anyhow::Result<HashSet<String>> {
         .map_err(|e| anyhow::anyhow!("inbox preload query failed: {}", e))?;
     let mut set = HashSet::with_capacity(rows.len());
     for (addr,) in rows {
-        set.insert(addr);
+        set.insert(addr.trim().to_lowercase());
     }
     Ok(set)
 }
@@ -770,26 +780,44 @@ async fn handle_smtp(
         let line_str = String::from_utf8_lossy(&buf);
         let cmd = line_str.trim_end();
 
-        if cmd.starts_with("HELO") {
+        // RFC 5321 §2.4: SMTP verbs are case-insensitive. Match on a length-
+        // bounded uppercase view so command parsing isn't fooled by mixed-case
+        // senders (e.g. `Mail From:` from some legacy MTAs). Address payload
+        // is still read from the original `cmd` to preserve case.
+        let verb_upper: String = cmd.chars().take(10).flat_map(char::to_uppercase).collect();
+
+        if verb_upper.starts_with("HELO") {
             let hostname = cmd.split_whitespace().nth(1).unwrap_or("unknown");
             debug!("[SMTP IN] HELO from {} [inst: {}]", hostname, instance.as_str());
             writer.write_all(b"250 Hello\r\n").await?;
-        } else if cmd.starts_with("EHLO") {
+        } else if verb_upper.starts_with("EHLO") {
             let hostname = cmd.split_whitespace().nth(1).unwrap_or("unknown");
             debug!("[SMTP IN] EHLO from {} [inst: {}]", hostname, instance.as_str());
             writer.write_all(
                 b"250-Hello\r\n250-SIZE 52428800\r\n250-8BITMIME\r\n250 ENHANCEDSTATUSCODES\r\n"
             ).await?;
-        } else if let Some(addr) = cmd.strip_prefix("MAIL FROM:") {
-            mail_from = addr.trim().to_string();
-            debug!("[SMTP IN] MAIL FROM: {} [inst: {}]", mail_from, instance.as_str());
-            writer.write_all(b"250 Ok\r\n").await?;
-        } else if let Some(addr) = cmd.strip_prefix("RCPT TO:") {
-            rcpt_to = addr.trim().to_string();
-            let email = extract_email(&rcpt_to);
+        } else if verb_upper.starts_with("MAIL FROM:") {
+            mail_from = cmd[10..].trim().to_string();
+            // Pre-check the declared SIZE= parameter so we can reject before
+            // the client wastes time uploading a 200 MB blob we'll discard.
+            let declared_size: Option<usize> = mail_from
+                .split_whitespace()
+                .find(|p| p.to_ascii_uppercase().starts_with("SIZE="))
+                .and_then(|p| p[5..].parse().ok());
+            if declared_size.is_some_and(|s| s > MAX_EMAIL_SIZE_BYTES) {
+                warn!("[SMTP] Rejected MAIL FROM: declared SIZE={} exceeds limit [inst: {}]",
+                      declared_size.unwrap(), instance.as_str());
+                writer.write_all(b"552 Message size exceeds fixed maximum message size\r\n").await?;
+            } else {
+                debug!("[SMTP IN] MAIL FROM: {} [inst: {}]", mail_from, instance.as_str());
+                writer.write_all(b"250 Ok\r\n").await?;
+            }
+        } else if verb_upper.starts_with("RCPT TO:") {
+            let candidate = cmd[8..].trim().to_string();
+            let email = extract_email(&candidate);
             let domain = email.split('@').nth(1).unwrap_or("").to_lowercase();
 
-            // FIX #9: O(1) domain check. Hold read guards over the sync lookup —
+            // O(1) domain check. Hold read guards over the sync lookup —
             // no per-email HashSet clone.
             let domain_allowed = {
                 let ex = ctx.whitelist_exact.read().await;
@@ -801,28 +829,31 @@ async fn handle_smtp(
                 warn!("[Domains] Rejected RCPT TO: {} (domain not allowed) [inst: {}]",
                       email, instance.as_str());
                 writer.write_all(b"550 Domain not allowed\r\n").await?;
+                // Do NOT update rcpt_to — keep the previously-accepted recipient.
             } else if is_domain_banned(&domain, &ctx.bans_cache).await {
                 warn!("[Bans] Rejected RCPT TO: {} (domain banned) [inst: {}]", email, instance.as_str());
                 writer.write_all(b"550 Domain banned\r\n").await?;
+                // Do NOT update rcpt_to — keep the previously-accepted recipient.
             } else {
                 debug!("[SMTP IN] RCPT TO: {} [inst: {}]", email, instance.as_str());
+                rcpt_to = candidate;
                 writer.write_all(b"250 Ok\r\n").await?;
             }
-        } else if cmd == "DATA" {
+        } else if cmd.eq_ignore_ascii_case("DATA") {
             data_mode = true;
             debug!("[SMTP IN] DATA command received [inst: {}]", instance.as_str());
             writer.write_all(b"354 End data with <CR><LF>.<CR><LF>\r\n").await?;
-        } else if cmd == "QUIT" {
+        } else if cmd.eq_ignore_ascii_case("QUIT") {
             debug!("[SMTP IN] QUIT command received [inst: {}]", instance.as_str());
             writer.write_all(b"221 Bye\r\n").await?;
             break;
-        } else if cmd == "RSET" {
+        } else if cmd.eq_ignore_ascii_case("RSET") {
             mail_from.clear();
             rcpt_to.clear();
             email_data.clear();
             data_mode = false;
             writer.write_all(b"250 Ok\r\n").await?;
-        } else if cmd == "NOOP" {
+        } else if cmd.eq_ignore_ascii_case("NOOP") {
             writer.write_all(b"250 Ok\r\n").await?;
         } else {
             warn!("[SMTP IN] Unknown command: {} [inst: {}]", cmd, instance.as_str());
@@ -1282,17 +1313,20 @@ async fn poll_bans(pool: PgPool, bans_cache: Arc<RwLock<BansCache>>) {
 async fn is_domain_banned(domain: &str, bans_cache: &Arc<RwLock<BansCache>>) -> bool {
     let guard = bans_cache.read().await;
     let lower = domain.to_lowercase();
-    if guard.domain.contains(&lower) {
-        return true;
-    }
-    // TLD wildcard check: "*.ru" matches "anything.ru"
-    if let Some(dot_pos) = lower.find('.') {
-        let tld = &lower[dot_pos + 1..];
-        if guard.domain_tlds.contains(tld) {
+
+    // Walk every ancestor suffix so a `*.ru` ban matches both `foo.ru` and
+    // `foo.bar.ru`. Previously only the first-level parent was checked, which
+    // let multi-level subdomains slip past TLD wildcards.
+    let mut current: &str = &lower;
+    loop {
+        if guard.domain.contains(current) || guard.domain_tlds.contains(current) {
             return true;
         }
+        match current.find('.') {
+            Some(idx) => current = &current[idx + 1..],
+            None => return false,
+        }
     }
-    false
 }
 
 async fn is_email_banned(from_lower: &str, bans_cache: &Arc<RwLock<BansCache>>) -> bool {
@@ -1490,12 +1524,23 @@ fn trim_trailing_crlf_len(buf: &[u8]) -> usize {
     end
 }
 
+/// Extract the bare address from a SMTP path, stripping angle brackets and
+/// any trailing ESMTP parameters (e.g. `SIZE=`, `BODY=`, `NOTIFY=`, `ORCPT=`).
+/// Per RFC 5321 §3.3, both MAIL FROM and RCPT TO may carry parameters after
+/// the address; without stripping, the whole string ends up in the extracted
+/// address — breaking the domain whitelist check (silent 550 reject) and
+/// polluting from_addr.
 fn extract_email(addr: &str) -> String {
-    if addr.starts_with('<') && addr.ends_with('>') {
-        addr[1..addr.len()-1].to_string()
-    } else {
-        addr.to_string()
+    let trimmed = addr.trim();
+    if let Some(rest) = trimmed.strip_prefix('<') {
+        if let Some(end) = rest.find('>') {
+            return rest[..end].to_string();
+        }
+        // Malformed (no closing '>') — take up to first whitespace.
+        return rest.split_whitespace().next().unwrap_or("").to_string();
     }
+    // Bare address (no angle brackets) — stop at first whitespace.
+    trimmed.split_whitespace().next().unwrap_or("").to_string()
 }
 
 fn sanitize_for_postgres(s: &str) -> String {
