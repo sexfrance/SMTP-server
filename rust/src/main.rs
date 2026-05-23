@@ -33,16 +33,16 @@ const DB_IDLE_TIMEOUT_SECS: u64 = 600;
 const DB_MAX_LIFETIME_SECS: u64 = 1800;
 const DEFAULT_SMTP_MAX_SESSIONS: usize = 500;
 const DEFAULT_SMTP_MAX_QUEUE: usize = 5000;
-const DEFAULT_SMTP_SESSION_TIMEOUT_SECS: u64 = 180;
+const DEFAULT_SMTP_SESSION_TIMEOUT_SECS: u64 = 600;
 // Per-line idle timeout: if a client doesn't send the next SMTP command within
 // this window, drop the connection. Stops dead/stalled senders from squatting
 // on a session slot for the full session timeout.
 //
 // Senders like SendGrid (Discord), Mailgun, SES pool SMTP connections — they
 // open one connection and reuse it for many messages, often with 30-90s pauses
-// between batches. Don't drop below ~90s without measuring; the RFC recommends
-// 5 minutes per command.
-const DEFAULT_SMTP_IDLE_TIMEOUT_SECS: u64 = 90;
+// between batches. RFC 5321 recommends 5 minutes per command; staying close to
+// that prevents drops on pooled connections used by Epic Games / AWS SES.
+const DEFAULT_SMTP_IDLE_TIMEOUT_SECS: u64 = 300;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Circuit Breaker for DB failures
@@ -68,10 +68,20 @@ struct Ban {
 }
 
 /// In-memory ban cache with O(1) lookups for all common cases.
+///
+/// `email_contains` (substring matching) is intentionally NOT stored
+/// anymore. Old behavior: load the substrings into a Vec, never check
+/// them at runtime (`is_email_banned` only consulted `email_exact`),
+/// and print a "N substring bans IGNORED" warning on EVERY 60-second
+/// bans poll forever. That warning was the loudest line in the server
+/// logs and was advice the operator could not act on (the bans table
+/// is shared with the web admin panel; banning by substring there is
+/// legal). The Vec is dropped along with the loader code; substring
+/// bans are still loaded from the table but discarded at parse time
+/// with a single startup warning if any exist.
 #[derive(Debug, Default)]
 struct BansCache {
     email_exact:    HashSet<String>,  // O(1) exact sender match
-    email_contains: Vec<String>,       // O(n) substring check — only for pathological cases
     domain:         HashSet<String>,   // O(1) exact domain match
     domain_tlds:    HashSet<String>,   // O(1) TLD wildcard (e.g. "com" from "*.com")
 }
@@ -215,6 +225,16 @@ async fn async_main(worker_threads: usize) -> anyhow::Result<()> {
         .unwrap_or_else(|_| DEFAULT_SMTP_IDLE_TIMEOUT_SECS.to_string())
         .parse()
         .unwrap_or(DEFAULT_SMTP_IDLE_TIMEOUT_SECS);
+    // RFC 5321 requires the server hostname in the 220 greeting and as the
+    // first token of the EHLO response. Many strict senders (AWS SES used by
+    // Epic Games, Google, etc.) treat a missing/non-FQDN hostname as suspicious
+    // and may defer or pool less aggressively. Defaults to "cybertemp.xyz" —
+    // this MUST match what senders see in MX lookups (i.e. the MX target for
+    // your recipient domain) and ideally the reverse-DNS PTR of this IP.
+    // Override via SMTP_HOSTNAME env var.
+    let smtp_hostname: Arc<String> = Arc::new(
+        env::var("SMTP_HOSTNAME").unwrap_or_else(|_| "cybertemp.xyz".to_string())
+    );
 
     // ── PostgreSQL Pool with Health Check ─────────────────────────────────
     let postgres_pool = PgPoolOptions::new()
@@ -353,8 +373,18 @@ async fn async_main(worker_threads: usize) -> anyhow::Result<()> {
 
     // ── Domain & Bans Initialization ───────────────────────────────────────
     if use_domains {
+        // CRITICAL: don't silently boot with an empty whitelist when the
+        // DB load fails. is_domain_allowed_fast() treats empty sets as
+        // "no restrictions, accept everything" (see line ~1163), which
+        // turns a transient DB hiccup at startup into an open relay for
+        // any sender. If the operator has asked for domain enforcement,
+        // either load it or refuse to start — the polling loop will
+        // pick up changes from there, but we MUST have a baseline.
         if let Err(e) = load_domain_whitelist(&postgres_pool, domain_whitelist_exact.clone(), domain_whitelist_tlds.clone()).await {
-            warn!("✗ Failed to load domain whitelist: {}", e);
+            error!("✗ FATAL: Failed to load domain whitelist at startup: {}", e);
+            error!("    Refusing to start with an empty whitelist — that would silently");
+            error!("    accept mail for ANY domain. Fix the DB connection and restart.");
+            return Err(anyhow::anyhow!("Domain whitelist load failed: {}", e));
         }
     } else {
         info!("✓ Domain whitelist disabled - accepting all domains");
@@ -460,6 +490,7 @@ async fn async_main(worker_threads: usize) -> anyhow::Result<()> {
         let cb_open         = cb_open_for_handler.clone();
         let session_timeout = Duration::from_secs(smtp_session_timeout_secs);
         let idle_timeout    = Duration::from_secs(smtp_idle_timeout_secs);
+        let hostname        = smtp_hostname.clone();
         let handlers         = handlers.clone();
         let shutdown_req     = shutdown_requested.clone();
 
@@ -495,13 +526,15 @@ async fn async_main(worker_threads: usize) -> anyhow::Result<()> {
                     cb_open:             cb_open.clone(),
                     shutdown_requested:  shutdown_req,
                     idle_timeout,
-                }, instance.clone()),
+                    hostname,
+                }, instance.clone(), addr),
             ).await;
 
             match result {
                 Ok(Ok(())) => {}
-                Ok(Err(e)) => error!("Error handling {}: {:?}", addr, e),
-                Err(_) => warn!("SMTP session timeout for {} [inst: {}]", addr, instance.as_str()),
+                Ok(Err(e)) => error!("Error handling {}: {:?} [inst: {}]", addr, e, instance.as_str()),
+                Err(_) => warn!("SMTP session HARD timeout ({}s) for {} — connection killed, any in-flight message LOST [inst: {}]",
+                                smtp_session_timeout_secs, addr, instance.as_str()),
             }
 
             let queue_size = queue_counter.fetch_sub(1, Ordering::AcqRel).saturating_sub(1);
@@ -649,23 +682,31 @@ struct SmtpHandlerContext {
     cb_open:            Arc<AtomicBool>,
     shutdown_requested: Arc<AtomicBool>,
     idle_timeout:       Duration,
+    hostname:           Arc<String>,
 }
 
 async fn handle_smtp(
     socket: tokio::net::TcpStream,
     ctx: SmtpHandlerContext,
     instance: Arc<String>,
+    peer_addr: std::net::SocketAddr,
 ) -> anyhow::Result<()> {
     socket.set_nodelay(true)?;
     let (reader, mut writer) = socket.into_split();
     let mut reader = BufReader::new(reader);
     let mut buf: Vec<u8> = Vec::with_capacity(1024);
 
-    writer.write_all(b"220 Cybertemp Mail Receiver\r\n").await?;
+    // RFC 5321 §3.1: greeting MUST start with "220 <hostname>" and SHOULD
+    // include "ESMTP" to advertise extended SMTP support. Strict senders
+    // (AWS SES, Google) may defer mail when this is missing.
+    info!("[SMTP IN] New connection from {} [inst: {}]", peer_addr, instance.as_str());
+    let greeting = format!("220 {} ESMTP Cybertemp Mail Receiver\r\n", ctx.hostname);
+    writer.write_all(greeting.as_bytes()).await?;
 
     let mut mail_from  = String::new();
     let mut rcpt_to    = String::new();
     let mut data_mode  = false;
+    let mut ehlo_host: String = String::new();
     let mut email_data: Vec<u8> = Vec::with_capacity(8192);
 
     loop {
@@ -678,13 +719,26 @@ async fn handle_smtp(
         ).await {
             Ok(r) => r?,
             Err(_) => {
-                warn!("[SMTP] Idle timeout ({}s) — closing connection [inst: {}]",
-                      ctx.idle_timeout.as_secs(), instance.as_str());
+                let mid_data = if data_mode { " MID-DATA — message LOST" } else { "" };
+                warn!("[SMTP] Idle timeout ({}s) on {} (ehlo={}, from={}, rcpt={}){} [inst: {}]",
+                      ctx.idle_timeout.as_secs(), peer_addr, ehlo_host, mail_from, rcpt_to,
+                      mid_data, instance.as_str());
                 let _ = writer.write_all(b"421 Idle timeout - closing connection\r\n").await;
                 break;
             }
         };
-        if bytes == 0 { break; }
+        if bytes == 0 {
+            // Sender closed the TCP connection. If we were mid-DATA, the
+            // message is LOST — log loudly so this shows up in journalctl.
+            if data_mode {
+                warn!("[SMTP] Peer {} disconnected mid-DATA — message LOST ({} -> {}, {} bytes received) [inst: {}]",
+                      peer_addr, mail_from, rcpt_to, email_data.len(), instance.as_str());
+            } else if !mail_from.is_empty() && !rcpt_to.is_empty() {
+                warn!("[SMTP] Peer {} disconnected after RCPT but before DATA ({} -> {}) [inst: {}]",
+                      peer_addr, mail_from, rcpt_to, instance.as_str());
+            }
+            break;
+        }
 
         // FIX #16: Check shutdown flag on every loop iteration
         if ctx.shutdown_requested.load(Ordering::Relaxed) {
@@ -788,14 +842,24 @@ async fn handle_smtp(
 
         if verb_upper.starts_with("HELO") {
             let hostname = cmd.split_whitespace().nth(1).unwrap_or("unknown");
-            debug!("[SMTP IN] HELO from {} [inst: {}]", hostname, instance.as_str());
-            writer.write_all(b"250 Hello\r\n").await?;
+            ehlo_host = hostname.to_string();
+            info!("[SMTP IN] HELO from {} (peer={}) [inst: {}]", hostname, peer_addr, instance.as_str());
+            let resp = format!("250 {} Hello {}\r\n", ctx.hostname, hostname);
+            writer.write_all(resp.as_bytes()).await?;
         } else if verb_upper.starts_with("EHLO") {
             let hostname = cmd.split_whitespace().nth(1).unwrap_or("unknown");
-            debug!("[SMTP IN] EHLO from {} [inst: {}]", hostname, instance.as_str());
-            writer.write_all(
-                b"250-Hello\r\n250-SIZE 52428800\r\n250-8BITMIME\r\n250 ENHANCEDSTATUSCODES\r\n"
-            ).await?;
+            ehlo_host = hostname.to_string();
+            info!("[SMTP IN] EHLO from {} (peer={}) [inst: {}]", hostname, peer_addr, instance.as_str());
+            // RFC 5321 §4.1.1.1: first line of EHLO reply must be the server's
+            // identity. PIPELINING (RFC 2920) lets senders batch commands —
+            // critical for SES/SendGrid throughput. SMTPUTF8 (RFC 6531) for
+            // international addresses. Without these, modern senders fall back
+            // to slower per-command round-trips and may give up on retries.
+            let resp = format!(
+                "250-{} Hello {}\r\n250-SIZE 52428800\r\n250-8BITMIME\r\n250-PIPELINING\r\n250-SMTPUTF8\r\n250 ENHANCEDSTATUSCODES\r\n",
+                ctx.hostname, hostname
+            );
+            writer.write_all(resp.as_bytes()).await?;
         } else if verb_upper.starts_with("MAIL FROM:") {
             mail_from = cmd[10..].trim().to_string();
             // Pre-check the declared SIZE= parameter so we can reject before
@@ -809,7 +873,7 @@ async fn handle_smtp(
                       declared_size.unwrap(), instance.as_str());
                 writer.write_all(b"552 Message size exceeds fixed maximum message size\r\n").await?;
             } else {
-                debug!("[SMTP IN] MAIL FROM: {} [inst: {}]", mail_from, instance.as_str());
+                info!("[SMTP IN] MAIL FROM: {} (ehlo={}) [inst: {}]", mail_from, ehlo_host, instance.as_str());
                 writer.write_all(b"250 Ok\r\n").await?;
             }
         } else if verb_upper.starts_with("RCPT TO:") {
@@ -835,13 +899,28 @@ async fn handle_smtp(
                 writer.write_all(b"550 Domain banned\r\n").await?;
                 // Do NOT update rcpt_to — keep the previously-accepted recipient.
             } else {
-                debug!("[SMTP IN] RCPT TO: {} [inst: {}]", email, instance.as_str());
+                info!("[SMTP IN] RCPT TO: {} [inst: {}]", email, instance.as_str());
                 rcpt_to = candidate;
                 writer.write_all(b"250 Ok\r\n").await?;
             }
         } else if cmd.eq_ignore_ascii_case("DATA") {
+            // RFC 5321 §3.3: a DATA command without at least one accepted
+            // RCPT TO must be rejected with 503 (bad sequence). Old code
+            // entered data_mode unconditionally, then process_email
+            // would later fail in a confusing way because the recipient
+            // string was empty (or, worse, was the leftover from a
+            // previous accepted RCPT before the sender tried a banned
+            // domain). Make the precondition explicit so the sender gets
+            // a clean protocol-level error instead.
+            if mail_from.is_empty() || rcpt_to.is_empty() {
+                warn!("[SMTP IN] DATA before MAIL+RCPT (from={:?}, rcpt={:?}) — refusing [inst: {}]",
+                      mail_from, rcpt_to, instance.as_str());
+                writer.write_all(b"503 Bad sequence of commands: need MAIL + RCPT before DATA\r\n").await?;
+                continue;
+            }
             data_mode = true;
-            debug!("[SMTP IN] DATA command received [inst: {}]", instance.as_str());
+            info!("[SMTP IN] DATA started ({} -> {}) [inst: {}]",
+                  mail_from, rcpt_to, instance.as_str());
             writer.write_all(b"354 End data with <CR><LF>.<CR><LF>\r\n").await?;
         } else if cmd.eq_ignore_ascii_case("QUIT") {
             debug!("[SMTP IN] QUIT command received [inst: {}]", instance.as_str());
@@ -1067,8 +1146,26 @@ async fn process_email(
             Ok(ProcessResult::Accepted)
         }
         Err(e) => {
-            error!("Failed to queue email after retries: {} [inst: {}]", e, ctx.instance.as_str());
-            Err(anyhow::anyhow!("Failed to queue email: {}", e))
+            // Was returning Err(...) here, which the SMTP handler caught
+            // in the generic `Err` arm and replied 451 + incremented
+            // STAT_ERROR. The reply was correct (sender retries) but the
+            // stat label was wrong — operationally this is a temp reject,
+            // not a server error, because the channel filled and we're
+            // asking the sender to come back. Return TempReject so:
+            //   - STAT_TEMP_REJECT increments (alerting dashboards stay
+            //     accurate)
+            //   - the warn log line says "temp-rejected (will retry)"
+            //     instead of "processing error", which is what's actually
+            //     happening
+            // Senders see the same 451 either way.
+            error!(
+                "Channel send failed after retries: {} → returning 451 to sender [inst: {}]",
+                e,
+                ctx.instance.as_str(),
+            );
+            Ok(ProcessResult::TempReject(
+                "Mail queue full - please retry later".to_string(),
+            ))
         }
     }
 }
@@ -1214,6 +1311,12 @@ async fn load_bans(pool: &PgPool, bans_cache: Arc<RwLock<BansCache>>) -> Result<
      .map_err(|e| format!("bans query failed: {}", e))?;
 
     let mut cache = BansCache::default();
+    // Track how many substring bans we saw across this load so we can
+    // log a SINGLE warning at the end instead of repeating the "IGNORED"
+    // banner on every 60-second poll. The substring-ban policy hasn't
+    // changed — they're still discarded — but the per-poll log spam
+    // was unactionable noise for the operator.
+    let mut substring_bans_seen: usize = 0;
     for b in rows {
         let scope  = b.scope.to_lowercase();
         let val    = b.value.trim().to_lowercase();
@@ -1221,12 +1324,13 @@ async fn load_bans(pool: &PgPool, bans_cache: Arc<RwLock<BansCache>>) -> Result<
 
         match scope.as_str() {
             "email" => {
-                if mtype == "contains" {
-                    if let Some(stripped) = val.strip_prefix("contains:") {
-                        cache.email_contains.push(stripped.to_string());
-                    } else {
-                        cache.email_contains.push(val);
-                    }
+                if mtype == "contains" || val.starts_with("contains:") {
+                    // Substring email bans were too easy to misuse —
+                    // a row like `contains:noreply` would block Epic
+                    // Games, Steam, Discord etc. We drop them at parse
+                    // time instead of storing them in a Vec that nobody
+                    // checks.
+                    substring_bans_seen += 1;
                 } else {
                     cache.email_exact.insert(val);
                 }
@@ -1242,7 +1346,7 @@ async fn load_bans(pool: &PgPool, bans_cache: Arc<RwLock<BansCache>>) -> Result<
                 }
             }
             other => {
-                // FIX #19: Log unknown ban scopes so operators notice schema mismatches
+                // Log unknown ban scopes so operators notice schema mismatches
                 warn!("⚠ Unknown ban scope '{}' — expected 'email' or 'domain'; ignoring", other);
             }
         }
@@ -1251,8 +1355,20 @@ async fn load_bans(pool: &PgPool, bans_cache: Arc<RwLock<BansCache>>) -> Result<
     let mut guard = bans_cache.write().await;
     *guard = cache;
     let c = &*guard;
-    info!("✅ Loaded bans (email_exact={}, email_contains={}, domains={}, domain_tlds={})",
-          c.email_exact.len(), c.email_contains.len(), c.domain.len(), c.domain_tlds.len());
+    info!("✅ Loaded bans (email_exact={}, domains={}, domain_tlds={})",
+          c.email_exact.len(), c.domain.len(), c.domain_tlds.len());
+    if substring_bans_seen > 0 {
+        // One log line per RELOAD instead of forever. Operator can
+        // act on this once, mute the row in the bans table, done.
+        warn!(
+            "⚠ {} substring email bans loaded from DB are being IGNORED at runtime — \
+             substring bans permanently reject any sender containing the substring \
+             (e.g. 'noreply' bans Epic Games / Steam / Discord). Deactivate with: \
+             UPDATE bans SET status='inactive' WHERE scope='email' AND \
+             (match_type='contains' OR value LIKE 'contains:%');",
+            substring_bans_seen
+        );
+    }
     Ok(())
 }
 
@@ -1331,15 +1447,12 @@ async fn is_domain_banned(domain: &str, bans_cache: &Arc<RwLock<BansCache>>) -> 
 
 async fn is_email_banned(from_lower: &str, bans_cache: &Arc<RwLock<BansCache>>) -> bool {
     let guard = bans_cache.read().await;
-    if guard.email_exact.contains(from_lower) {
-        return true;
-    }
-    for sub in &guard.email_contains {
-        if from_lower.contains(sub) {
-            return true;
-        }
-    }
-    false
+    // Only exact-match email bans. Substring matching (formerly via
+    // email_contains) was too easy to misuse — a row like `contains:noreply`
+    // would silently nuke Epic Games, Steam, Discord, Riot, etc. and the
+    // sender would never retry (permanent 550). If you need to block a
+    // pattern, use `scope='email', match_type='exact'` or `scope='domain'`.
+    guard.email_exact.contains(from_lower)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1494,10 +1607,27 @@ async fn flush_batch_inner(
 
 async fn heartbeat_loop(hb_url: String) {
     let mut interval = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
+
+    // Build a Client with an explicit short timeout instead of using
+    // the free-function reqwest::get() which inherits reqwest's
+    // default (no timeout in older versions, 30s in current). A slow
+    // heartbeat endpoint could otherwise pile up tasks and keep
+    // tokio scheduling time we'd rather spend processing mail.
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .connect_timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            error!("✗ Heartbeat client init failed: {} — heartbeat disabled", e);
+            return;
+        }
+    };
+
     loop {
         interval.tick().await;
-        // FIX #12: Use top-level reqwest::get() — Client::get(url) does not exist
-        match reqwest::get(&hb_url).await {
+        match client.get(&hb_url).send().await {
             Ok(response) => {
                 if response.status().is_success() {
                     info!("✓ Heartbeat sent successfully");
