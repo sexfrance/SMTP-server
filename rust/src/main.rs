@@ -88,6 +88,8 @@ struct BansCache {
 
 
 
+mod encryption;
+
 #[derive(Debug, Clone)]
 struct EmailInsert {
     mailbox_owner: String,
@@ -98,6 +100,78 @@ struct EmailInsert {
     from_addr: String,
     to_addrs: Vec<String>,
     size: i64,
+    encrypted: bool,
+    key_version: i32,
+}
+
+// ── Inbox at-rest encryption (key-gated — see encryption.rs) ─────────────────
+// Per-recipient preference + salt, cached 30s to keep the email pipeline off an
+// N+1 lookup. Anonymous inboxes / missing users default to encrypt=true with the
+// master key (salt=None); a user with encrypt_inboxes=false opts out entirely.
+static ENC_PREF_CACHE: once_cell::sync::Lazy<
+    std::sync::Mutex<std::collections::HashMap<String, (bool, Option<String>, std::time::Instant)>>,
+> = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+const ENC_PREF_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+async fn lookup_encryption_pref(pool: &PgPool, mailbox: &str) -> (bool, Option<String>) {
+    let key = mailbox.to_lowercase();
+    {
+        let cache = ENC_PREF_CACHE.lock().unwrap();
+        if let Some((pref, salt, at)) = cache.get(&key) {
+            if at.elapsed() < ENC_PREF_TTL {
+                return (*pref, salt.clone());
+            }
+        }
+    }
+    let row: Option<(Option<bool>, Option<String>)> = sqlx::query_as(
+        "SELECT u.encrypt_inboxes, u.encryption_salt \
+         FROM inbox i LEFT JOIN users u ON u.id = i.user_id \
+         WHERE LOWER(i.email_address) = LOWER($1) LIMIT 1",
+    )
+    .bind(mailbox)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None);
+    let (pref, salt) = match row {
+        Some((enc, salt)) => (enc.unwrap_or(true), salt),
+        None => (true, None),
+    };
+    ENC_PREF_CACHE
+        .lock()
+        .unwrap()
+        .insert(key, (pref, salt.clone(), std::time::Instant::now()));
+    (pref, salt)
+}
+
+// Encrypt the four payload fields for `recipient` when encryption is configured
+// and the recipient hasn't opted out. Returns the (possibly unchanged) fields
+// plus the encrypted flag + key version to stamp on the row.
+async fn seal_email_fields(
+    pool: &PgPool,
+    recipient: &str,
+    subject: String,
+    body: String,
+    html: String,
+    from_addr: String,
+) -> (String, String, String, String, bool, i32) {
+    if !encryption::is_configured() {
+        return (subject, body, html, from_addr, false, encryption::KEY_VERSION);
+    }
+    let (pref, salt) = lookup_encryption_pref(pool, recipient).await;
+    if !pref {
+        return (subject, body, html, from_addr, false, encryption::KEY_VERSION);
+    }
+    match encryption::derive_key(salt.as_deref()) {
+        Some(key) => (
+            encryption::encrypt_with(&key, &subject),
+            encryption::encrypt_with(&key, &body),
+            encryption::encrypt_with(&key, &html),
+            encryption::encrypt_with(&key, &from_addr),
+            true,
+            encryption::KEY_VERSION,
+        ),
+        None => (subject, body, html, from_addr, false, encryption::KEY_VERSION),
+    }
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -1086,6 +1160,20 @@ async fn process_email(
     info!("✉ Parsed email for {} from {} — Subject: '{}' [inst: {}]",
           recipient_email, from_address, subject, ctx.instance.as_str());
 
+    // Seal payload fields at rest (no-op unless ENCRYPTION_MASTER_KEY_V1 is set
+    // and the recipient hasn't opted out). Done once here so both the private
+    // and temp paths below persist the sealed values.
+    let (subject, text_body, html_body, from_address, encrypted, key_version) =
+        seal_email_fields(
+            &ctx.postgres_pool,
+            &recipient_email,
+            subject,
+            text_body,
+            html_body,
+            from_address,
+        )
+        .await;
+
     // Private email path — O(1) in-memory cache lookup instead of a per-message
     // SELECT. Cache is refreshed by poll_private_emails. New private addresses
     // may take up to PRIVATE_EMAIL_POLL_INTERVAL_SECS to propagate.
@@ -1101,6 +1189,8 @@ async fn process_email(
             from_addr: from_address.clone(),
             to_addrs: to_addrs_vec,
             size: raw_size,
+            encrypted,
+            key_version,
         };
 
         match send_with_retry(&ctx.batch_sender, email_insert).await {
@@ -1138,6 +1228,8 @@ async fn process_email(
         from_addr: from_address,
         to_addrs: to_addrs_vec,
         size: raw_size,
+        encrypted,
+        key_version,
     };
 
     match send_with_retry(&ctx.batch_sender, email_insert).await {
@@ -1574,7 +1666,7 @@ async fn flush_batch_inner(
     }
 
     let mut query = sqlx::QueryBuilder::new(
-        "INSERT INTO emails (mailbox_owner, mailbox, subject, body, html, from_addr, to_addrs, size, created_at) "
+        "INSERT INTO emails (mailbox_owner, mailbox, subject, body, html, from_addr, to_addrs, size, encrypted, key_version, created_at) "
     );
     query.push_values(buffer.iter(), |mut b, email| {
         b.push_bind(&email.mailbox_owner)
@@ -1585,6 +1677,8 @@ async fn flush_batch_inner(
             .push_bind(&email.from_addr)
             .push_bind(&email.to_addrs)
             .push_bind(email.size)
+            .push_bind(email.encrypted)
+            .push_bind(email.key_version)
             .push("NOW()");
     });
 
