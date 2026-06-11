@@ -25,3 +25,16 @@ aes-gcm = "0.10"
 hkdf = "0.12"
 sha2 = "0.10"
 hex = "0.4"
+
+# Release build tuned for runtime throughput (compiled once, runs for weeks).
+# Fat LTO + a single codegen unit let the optimizer inline across the whole
+# crate graph — meaningful on the CPU-bound hot path (mailparse + AES-GCM seal).
+# NOTE: panic stays "unwind" (the default) ON PURPOSE — the batch-worker
+# supervisor restarts the worker by catching its panic via `handle.await`;
+# `panic = "abort"` would kill the whole process instead. Switch lto to "thin"
+# if local compile time becomes painful (keeps most of the win).
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = "debuginfo"
